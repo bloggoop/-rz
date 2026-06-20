@@ -18,11 +18,11 @@ int LEFT_SPEED_TRIM = -2;
 // 直角弯冲出去就降到 34；太慢就升到 38
 int BASE_SPEED = 36;
 
-int MAX_SPEED = 60;
+int MAX_SPEED = 80;
 
 // 普通循迹转向力度
 // 抖就降到 6；普通弯转不过就升到 8
-int TURN_SPEED_STEP = 10;
+int TURN_SPEED_STEP = 8;
 
 // 直角弯时使用的强制转向权重
 // 直角弯响应慢就升到 7；甩头就降到 5
@@ -34,7 +34,7 @@ int LOST_TURN_WEIGHT = 4;
 
 // 连续检测到几次外侧压线，才认为是直角弯
 // 响应慢就用 2；S弯误判就用 3 或 4
-int HARD_CONFIRM_COUNT = 3;
+int HARD_CONFIRM_COUNT = 1;
 
 // 连续丢线几次，才进入丢线找线
 // 误触发 LOST 就升到 4；丢线救不回来就降到 2
@@ -47,7 +47,7 @@ int LOOP_DELAY_MS = 3;
 // 串口打印间隔
 int PRINT_INTERVAL_MS = 200;
 
-const int GRAY_SENSOR_PINS[5] = {27, 33, 32, 35, 34};
+const int GRAY_SENSOR_PINS[5] = {33, 32, 35, 34, 27};
 int GRAY_THRESHOLD = 600;
 
 // 左外、左内、中、右内、右外
