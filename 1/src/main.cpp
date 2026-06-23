@@ -1,68 +1,5 @@
 #include <Arduino.h>
-
-const int PWM_FREQ = 20000;
-const int PWM_RESOLUTION = 10;
-const int PWM_MAX = 1023;
-
-// =========================
-// =========================
-// 调参区
-// =========================
-
-// 左轮整体补偿：
-// 左轮快：填负数，例如 -2、-3
-// 左轮慢：填正数，例如 2、3
-int LEFT_SPEED_TRIM = -2;
-
-// 直线速度
-// 直角弯冲出去就降到 34；太慢就升到 38
-int BASE_SPEED = 36;
-
-int MAX_SPEED = 80;
-
-// 普通循迹转向力度
-// 抖就降到 6；普通弯转不过就升到 8
-int TURN_SPEED_STEP = 8;
-
-// 直角弯时使用的强制转向权重
-// 直角弯响应慢就升到 7；甩头就降到 5
-int HARD_TURN_WEIGHT = 15;
-
-// 丢线找线时使用的转向权重
-// 丢线后找不回来就升到 5；乱甩就降到 3
-int LOST_TURN_WEIGHT = 4;
-
-// 连续检测到几次外侧压线，才认为是直角弯
-// 响应慢就用 2；S弯误判就用 3 或 4
-int HARD_CONFIRM_COUNT = 1;
-
-// 连续丢线几次，才进入丢线找线
-// 误触发 LOST 就升到 4；丢线救不回来就降到 2
-int LOST_CONFIRM_COUNT = 4;
-
-// 主循环延时
-// 5ms 反应更快；10ms 稳一点但滞后更大
-int LOOP_DELAY_MS = 3;
-
-// 串口打印间隔
-int PRINT_INTERVAL_MS = 200;
-
-const int GRAY_SENSOR_PINS[5] = {33, 32, 35, 34, 27};
-int GRAY_THRESHOLD = 600;
-
-// 左外、左内、中、右内、右外
-// 比 {-10,-2,0,2,10} 温和，减少 S 弯乱甩
-const int GRAY_SENSOR_WEIGHTS[5] = {-4, -2, 0, 2, 4};
-
-const int LED_PIN = 22;
-const int LED_PWM_FREQ = 1000;
-const int LED_BREATH_STEP = 24;
-
-const int LEFT_MOTOR_PINS[2] = {14, 25};
-const int RIGHT_MOTOR_PINS[2] = {13, 15};
-
-const int LEFT_ENCODER_PINS[2] = {18, 19};
-const int RIGHT_ENCODER_PINS[2] = {16, 17};
+#include "params.h"
 
 class Motor {
 public:
@@ -248,8 +185,6 @@ Encoder rightEncoder(RIGHT_ENCODER_PINS[0], RIGHT_ENCODER_PINS[1]);
 BreathingLed led(LED_PIN, 4);
 GraySensorArray gray;
 
-unsigned long lastPrintTime = 0;
-
 // 记录上一次转向方向
 // -1 = 上次偏左
 //  1 = 上次偏右
@@ -261,9 +196,6 @@ int rightHardCount = 0;
 int lostLineCount = 0;
 
 void setup() {
-    Serial.begin(115200);
-    delay(500);
-
     leftMotor.begin();
     rightMotor.begin();
 
@@ -272,8 +204,6 @@ void setup() {
 
     led.begin();
     gray.begin();
-
-    Serial.println("ESP32 Line Follower Start");
 }
 
 void loop() {
@@ -322,7 +252,7 @@ void loop() {
     bool hardRight = rightHardCount >= HARD_CONFIRM_COUNT;
     bool realLost = lostLineCount >= LOST_CONFIRM_COUNT;
 
-    // 只在真的看到线时更新上一次方向
+    // 只在当前确实看到线时，更新“上一次偏左/偏右”的记忆
     if (lineSeen) {
         if (hardLeft) {
             lastTurnDir = -1;
@@ -335,17 +265,10 @@ void loop() {
         }
     }
 
-    const char *mode = "NORMAL";
-
     int finalTurnWeight = turnWeight;
 
     if (realLost) {
-        // =========================
-        // 真丢线找线
-        // 不直接改左右轮方向，只给一个找线 turnWeight
-        // =========================
-        mode = "LOST";
-
+        // 真丢线时，按上一次偏左/偏右的方向去找回黑线
         if (lastTurnDir > 0) {
             finalTurnWeight = LOST_TURN_WEIGHT;
         } else {
@@ -353,39 +276,30 @@ void loop() {
         }
 
     } else if (hardLeft) {
-        // =========================
-        // 左直角弯
-        // 不乱改方向，只把 turnWeight 加大
-        // =========================
-        mode = "HARD_LEFT";
+        // 左直角弯：直接给一个固定的强转向权重
         finalTurnWeight = -HARD_TURN_WEIGHT;
 
     } else if (hardRight) {
-        // =========================
-        // 右直角弯
-        // 不乱改方向，只把 turnWeight 加大
-        // =========================
-        mode = "HARD_RIGHT";
+        // 右直角弯：直接给一个固定的强转向权重
         finalTurnWeight = HARD_TURN_WEIGHT;
 
     } else {
-        mode = "NORMAL";
+        // 普通循迹：直接使用灰度传感器算出来的转向权重
         finalTurnWeight = turnWeight;
     }
 
     int speedDelta = TURN_SPEED_STEP * finalTurnWeight;
 
-    // =========================
-    // 关键：回到你原来的方向公式
-    // 不再乱改成别的方向
-    // =========================
+    // 速度差公式：
+    // turnWeight > 0 时，右轮更快，车身向右修正
+    // turnWeight < 0 时，左轮更快，车身向左修正
     int leftSpeed = BASE_SPEED - speedDelta;
     int rightSpeed = BASE_SPEED + speedDelta;
 
-    // 左轮整体速度补偿
+    // 左电机通常会比右电机略快一点，这里做整体补偿
     leftSpeed += LEFT_SPEED_TRIM;
 
-    // 防止强转时一边算成太离谱
+    // 限制输出范围，避免速度超出电机允许值
     leftSpeed = -constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
     rightSpeed = -constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
 
@@ -393,65 +307,6 @@ void loop() {
     rightMotor.setSpeed(rightSpeed);
 
     led.update();
-
-    unsigned long now = millis();
-
-    if (now - lastPrintTime >= PRINT_INTERVAL_MS) {
-        Serial.print("mode=");
-        Serial.print(mode);
-
-        Serial.print(", gray=[");
-
-        for (int i = 0; i < 5; i++) {
-            Serial.print(values[i]);
-            if (i < 4) Serial.print(", ");
-        }
-
-        Serial.print("], active=[");
-
-        for (int i = 0; i < 5; i++) {
-            Serial.print(active[i] ? 1 : 0);
-            if (i < 4) Serial.print(", ");
-        }
-
-        Serial.print("], count=");
-        Serial.print(activeCount);
-
-        Serial.print(", rawTurn=");
-        Serial.print(turnWeight);
-
-        Serial.print(", finalTurn=");
-        Serial.print(finalTurnWeight);
-
-        Serial.print(", delta=");
-        Serial.print(speedDelta);
-
-        Serial.print(", leftHardCount=");
-        Serial.print(leftHardCount);
-
-        Serial.print(", rightHardCount=");
-        Serial.print(rightHardCount);
-
-        Serial.print(", lostCount=");
-        Serial.print(lostLineCount);
-
-        Serial.print(", lastDir=");
-        Serial.print(lastTurnDir);
-
-        Serial.print(", L=");
-        Serial.print(leftSpeed);
-
-        Serial.print(", R=");
-        Serial.print(rightSpeed);
-
-        Serial.print(", encL=");
-        Serial.print(leftEncoder.read());
-
-        Serial.print(", encR=");
-        Serial.println(rightEncoder.read());
-
-        lastPrintTime = now;
-    }
 
     delay(LOOP_DELAY_MS);
 }
