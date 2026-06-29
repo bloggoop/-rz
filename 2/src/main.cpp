@@ -23,6 +23,7 @@
 
 constexpr char AP_SSID[] = "ESP32S3-CAM";
 constexpr char AP_PASSWORD[] = "12345678";
+constexpr uint8_t BINARY_THRESHOLD = 128;
 
 WebServer server(80);
 static bool cameraReady = false;
@@ -50,8 +51,8 @@ static bool initCamera()
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
     config.xclk_freq_hz = 20000000;
-    config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size = psramFound() ? FRAMESIZE_VGA : FRAMESIZE_QVGA;
+    config.pixel_format = PIXFORMAT_GRAYSCALE;
+    config.frame_size = FRAMESIZE_QVGA;
     config.jpeg_quality = 12;
     config.fb_count = psramFound() ? 2 : 1;
     config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
@@ -68,7 +69,6 @@ static bool initCamera()
     sensor_t *sensor = esp_camera_sensor_get();
     if (sensor != nullptr) {
         sensor->set_framesize(sensor, config.frame_size);
-        sensor->set_quality(sensor, config.jpeg_quality);
     }
 
     Serial.println("Camera init OK");
@@ -96,9 +96,9 @@ static void handleRoot()
 <body>
   <header>ESP32-S3 Camera</header>
   <main>
-    <img id="frame" src="/capture" alt="camera frame">
+    <img id="frame" src="/binary" alt="binary camera frame">
     <p id="status" class="status">Loading frames...</p>
-    <p class="links">Still image: <a href="/capture">/capture</a> | MJPEG: <a href="/stream">/stream</a></p>
+    <p class="links">Binary image: <a href="/binary">/binary</a> | threshold: 128</p>
   </main>
   <script>
     const frame = document.getElementById('frame');
@@ -106,7 +106,7 @@ static void handleRoot()
     let count = 0;
 
     function nextFrame() {
-      frame.src = '/capture?t=' + Date.now();
+      frame.src = '/binary?t=' + Date.now();
     }
 
     frame.onload = () => {
@@ -143,19 +143,83 @@ static void handleCapture()
         return;
     }
 
+    if (fb->format != PIXFORMAT_GRAYSCALE) {
+        esp_camera_fb_return(fb);
+        server.send(500, "text/plain", "Camera is not in grayscale mode");
+        return;
+    }
+
     captureCount++;
-    Serial.printf("Capture #%lu: %ux%u len=%u\r\n",
+    Serial.printf("Binary #%lu: %ux%u gray_len=%u threshold=%u\r\n",
                   static_cast<unsigned long>(captureCount),
                   fb->width,
                   fb->height,
-                  fb->len);
+                  fb->len,
+                  BINARY_THRESHOLD);
 
     WiFiClient client = server.client();
+    const uint32_t width = fb->width;
+    const uint32_t height = fb->height;
+    const uint32_t rowSize = ((width * 3) + 3) & ~3U;
+    const uint32_t pixelBytes = rowSize * height;
+    const uint32_t fileSize = 54 + pixelBytes;
+
     client.print("HTTP/1.1 200 OK\r\n");
-    client.print("Content-Type: image/jpeg\r\n");
+    client.print("Content-Type: image/bmp\r\n");
     client.print("Cache-Control: no-store\r\n");
-    client.printf("Content-Length: %u\r\n\r\n", fb->len);
-    client.write(fb->buf, fb->len);
+    client.printf("Content-Length: %lu\r\n\r\n", static_cast<unsigned long>(fileSize));
+
+    auto writeU16 = [&client](uint16_t value) {
+        uint8_t bytes[2] = {
+            static_cast<uint8_t>(value & 0xFF),
+            static_cast<uint8_t>((value >> 8) & 0xFF),
+        };
+        client.write(bytes, sizeof(bytes));
+    };
+    auto writeU32 = [&client](uint32_t value) {
+        uint8_t bytes[4] = {
+            static_cast<uint8_t>(value & 0xFF),
+            static_cast<uint8_t>((value >> 8) & 0xFF),
+            static_cast<uint8_t>((value >> 16) & 0xFF),
+            static_cast<uint8_t>((value >> 24) & 0xFF),
+        };
+        client.write(bytes, sizeof(bytes));
+    };
+
+    client.write('B');
+    client.write('M');
+    writeU32(fileSize);
+    writeU16(0);
+    writeU16(0);
+    writeU32(54);
+    writeU32(40);
+    writeU32(width);
+    writeU32(height);
+    writeU16(1);
+    writeU16(24);
+    writeU32(0);
+    writeU32(pixelBytes);
+    writeU32(2835);
+    writeU32(2835);
+    writeU32(0);
+    writeU32(0);
+
+    uint8_t row[960] = {};
+    for (int32_t y = static_cast<int32_t>(height) - 1; y >= 0; --y) {
+        const uint8_t *src = fb->buf + (static_cast<uint32_t>(y) * width);
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint8_t value = src[x] >= BINARY_THRESHOLD ? 255 : 0;
+            const uint32_t offset = x * 3;
+            row[offset + 0] = value;
+            row[offset + 1] = value;
+            row[offset + 2] = value;
+        }
+        for (uint32_t i = width * 3; i < rowSize; ++i) {
+            row[i] = 0;
+        }
+        client.write(row, rowSize);
+    }
+
     esp_camera_fb_return(fb);
 }
 
@@ -188,7 +252,10 @@ static void startCameraServer()
 {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/capture", HTTP_GET, handleCapture);
-    server.on("/stream", HTTP_GET, handleStream);
+    server.on("/binary", HTTP_GET, handleCapture);
+    server.on("/stream", HTTP_GET, []() {
+        server.send(200, "text/plain", "MJPEG stream is disabled. Open /binary for thresholded output.");
+    });
     server.begin();
     Serial.println("HTTP server started");
 }
@@ -233,4 +300,3 @@ void loop()
                       static_cast<unsigned long>(captureCount));
     }
 }
-
