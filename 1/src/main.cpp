@@ -4,13 +4,15 @@
 #include <math.h>
 #include <stdio.h>
 #include "params.h"
+#include "uart.h"
 
 class Motor {
 public:
     Motor(int in1, int in2, int ch1, int ch2, bool reverse = false)
         : in1Pin(in1), in2Pin(in2), pwmCh1(ch1), pwmCh2(ch2), reversed(reverse) {}
 
-    void begin() {
+    void begin() 
+    {
         ledcSetup(pwmCh1, PWM_FREQ, PWM_RESOLUTION);
         ledcSetup(pwmCh2, PWM_FREQ, PWM_RESOLUTION);
         ledcAttachPin(in1Pin, pwmCh1);
@@ -18,34 +20,43 @@ public:
         stop();
     }
 
-    void setSpeed(int speed) {
+    void setSpeed(int speed) 
+    {
         speed = constrain(speed, -100, 100);
 
-        if (reversed) {
+        if (reversed) 
+        {
             speed = -speed;
         }
 
         int absSpeed = abs(speed);
         int duty = 0;
 
-        if (absSpeed > 0) {
+        if (absSpeed > 0) 
+        {
             const int MIN_DUTY = 580;
             duty = map(absSpeed, 1, 100, MIN_DUTY, PWM_MAX);
             duty = constrain(duty, 0, PWM_MAX);
         }
 
-        if (speed > 0) {
+        if (speed > 0) 
+        {
             ledcWrite(pwmCh1, duty);
             ledcWrite(pwmCh2, 0);
-        } else if (speed < 0) {
+        } 
+        else if (speed < 0) 
+        {
             ledcWrite(pwmCh1, 0);
             ledcWrite(pwmCh2, duty);
-        } else {
+        }
+        else 
+        {
             stop();
         }
     }
 
-    void stop() {
+    void stop() 
+    {
         ledcWrite(pwmCh1, 0);
         ledcWrite(pwmCh2, 0);
     }
@@ -73,7 +84,8 @@ public:
         int currentA = digitalRead(pinA);
         int currentB = digitalRead(pinB);
 
-        if (currentA != lastA && currentA == HIGH) {
+        if (currentA != lastA && currentA == HIGH) 
+        {
             int step = (currentB == LOW) ? -1 : 1;
             count += reversed ? -step : step;
         }
@@ -81,11 +93,13 @@ public:
         lastA = currentA;
     }
 
-    long read() {
+    long read() 
+    {
         return count;
     }
 
-    void reset() {
+    void reset() 
+    {
         count = 0;
     }
 
@@ -101,19 +115,24 @@ class BreathingLed {
 public:
     BreathingLed(int pin, int ch) : ledPin(pin), pwmCh(ch) {}
 
-    void begin() {
+    void begin() 
+    {
         ledcSetup(pwmCh, LED_PWM_FREQ, PWM_RESOLUTION);
         ledcAttachPin(ledPin, pwmCh);
         ledcWrite(pwmCh, 0);
     }
 
-    void update() {
+    void update() 
+    {
         duty += step;
 
-        if (duty >= PWM_MAX) {
+        if (duty >= PWM_MAX) 
+        {
             duty = PWM_MAX;
             step = -LED_BREATH_STEP;
-        } else if (duty <= 0) {
+        } 
+        else if (duty <= 0) 
+        {
             duty = 0;
             step = LED_BREATH_STEP;
         }
@@ -121,7 +140,8 @@ public:
         ledcWrite(pwmCh, duty);
     }
 
-    void off() {
+    void off() 
+    {
         ledcWrite(pwmCh, 0);
     }
 
@@ -134,37 +154,45 @@ private:
 
 class GraySensorArray {
 public:
-    void begin() {
+    void begin() 
+    {
         analogReadResolution(12);
 
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 5; i++) 
+        {
             pinMode(GRAY_SENSOR_PINS[i], INPUT);
             analogSetPinAttenuation(GRAY_SENSOR_PINS[i], ADC_11db);
         }
     }
 
-    void readRaw(int values[5]) {
-        for (int i = 0; i < 5; i++) {
+    void readRaw(int values[5]) 
+    {
+        for (int i = 0; i < 5; i++) 
+        {
             values[i] = analogRead(GRAY_SENSOR_PINS[i]);
         }
     }
 
-    int readTurnWeight(int values[5], bool active[5], int &activeCount) {
+    int readTurnWeight(int values[5], bool active[5], int &activeCount) 
+    {
         readRaw(values);
 
         int weightSum = 0;
         activeCount = 0;
 
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 5; i++) 
+        {
             active[i] = values[i] > GRAY_THRESHOLD;
 
-            if (active[i]) {
+            if (active[i])
+            {
                 weightSum += GRAY_SENSOR_WEIGHTS[i];
                 activeCount++;
             }
         }
 
-        if (activeCount == 0) {
+        if (activeCount == 0) 
+        {
             return lastTurnWeight;
         }
 
@@ -220,7 +248,8 @@ bool hasGrayDWeight = false;
 
 static void connectTelemetryLink()
 {
-    if (!ENABLE_MPU_TELEMETRY) {
+    if (!ENABLE_MPU_TELEMETRY) 
+    {
         wifiConnected = false;
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
@@ -233,28 +262,35 @@ static void connectTelemetryLink()
 
     wifiConnected = (WiFi.status() == WL_CONNECTED);
 
-    if (wifiConnected) {
+    if (wifiConnected) 
+    {
         telemetryUdp.begin(TELEMETRY_UDP_PORT);
         Serial.printf("Telemetry WiFi connected, IP=%s\r\n", WiFi.localIP().toString().c_str());
-    } else {
+    } 
+    else 
+    {
         Serial.println("Telemetry WiFi connecting...");
     }
 }
 
 static void updateTelemetryLink()
 {
-    if (!ENABLE_MPU_TELEMETRY) {
+    if (!ENABLE_MPU_TELEMETRY) 
+    {
         return;
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
+    if (WiFi.status() != WL_CONNECTED) 
+    {
         wifiConnected = false;
     }
 
-    if (!wifiConnected) {
+    if (!wifiConnected) 
+    {
         uint32_t now = millis();
 
-        if (now - lastWifiRetryMs >= 3000) {
+        if (now - lastWifiRetryMs >= 3000) 
+        {
             lastWifiRetryMs = now;
             connectTelemetryLink();
         }
@@ -263,11 +299,13 @@ static void updateTelemetryLink()
 
     int packetSize = telemetryUdp.parsePacket();
 
-    while (packetSize > 0) {
+    while (packetSize > 0) 
+    {
         char packet[128];
         int len = telemetryUdp.read(packet, sizeof(packet) - 1);
 
-        if (len > 0) {
+        if (len > 0) 
+        {
             packet[len] = '\0';
 
             char tag = '\0';
@@ -302,7 +340,9 @@ static void updateTelemetryLink()
                 mpuTelemetry.lostCount = lostCount;
                 mpuTelemetry.lastUpdateMs = millis();
                 mpuTelemetry.packetCount++;
-            } else {
+            } 
+            else 
+            {
                 mpuTelemetry.parseFailCount++;
             }
         }
@@ -313,7 +353,8 @@ static void updateTelemetryLink()
 
 static bool mpuTelemetryFresh()
 {
-    if (!mpuTelemetry.valid) {
+    if (!mpuTelemetry.valid) 
+    {
         return false;
     }
 
@@ -363,9 +404,12 @@ void loop() {
     // =========================
     // 丢线确认
     // =========================
-    if (!lineSeen) {
+    if (!lineSeen) 
+    {
         lostLineCount++;
-    } else {
+    } 
+    else 
+    {
         lostLineCount = 0;
     }
 
@@ -375,18 +419,24 @@ void loop() {
     // 左直角弯：
     // 左外侧连续压线，并且中间、右侧没有压线
     // 允许左内侧同时压线
-    if (active[0] && !active[2] && !active[3] && !active[4]) {
+    if (active[0] && !active[2] && !active[3] && !active[4]) 
+    {
         leftHardCount++;
-    } else {
+    } 
+    else 
+    {
         leftHardCount = 0;
     }
 
     // 右直角弯：
     // 右外侧连续压线，并且中间、左侧没有压线
     // 允许右内侧同时压线
-    if (active[4] && !active[2] && !active[1] && !active[0]) {
+    if (active[4] && !active[2] && !active[1] && !active[0]) 
+    {
         rightHardCount++;
-    } else {
+    } 
+    else 
+    {
         rightHardCount = 0;
     }
 
@@ -395,14 +445,22 @@ void loop() {
     bool realLost = lostLineCount >= LOST_CONFIRM_COUNT;
 
     // 只在当前确实看到线时，更新“上一次偏左/偏右”的记忆
-    if (lineSeen) {
-        if (hardLeft) {
+    if (lineSeen) 
+    {
+        if (hardLeft) 
+        {
             lastTurnDir = -1;
-        } else if (hardRight) {
+        } 
+        else if (hardRight) 
+        {
             lastTurnDir = 1;
-        } else if (turnWeight < 0) {
+        } 
+        else if (turnWeight < 0) 
+        {
             lastTurnDir = -1;
-        } else if (turnWeight > 0) {
+        } 
+        else if (turnWeight > 0) 
+        {
             lastTurnDir = 1;
         }
     }
@@ -412,32 +470,44 @@ void loop() {
     float grayDCorrection = 0.0f;
     float gyroCorrection = 0.0f;
 
-    if (realLost) {
+    if (realLost) 
+    {
         // 真丢线时，按上一次偏左/偏右的方向去找回黑线
-        if (lastTurnDir > 0) {
+        if (lastTurnDir > 0) 
+        {
             finalTurnWeight = LOST_TURN_WEIGHT;
-        } else {
+        } 
+        else 
+        {
             finalTurnWeight = -LOST_TURN_WEIGHT;
         }
         controlTurnWeight = static_cast<float>(finalTurnWeight);
 
-    } else if (hardLeft) {
+    } 
+    else if (hardLeft) 
+    {
         // 左直角弯：直接给一个固定的强转向权重
         finalTurnWeight = -HARD_TURN_WEIGHT;
         controlTurnWeight = static_cast<float>(finalTurnWeight);
 
-    } else if (hardRight) {
+    } 
+    else if (hardRight) 
+    {
         // 右直角弯：直接给一个固定的强转向权重
         finalTurnWeight = HARD_TURN_WEIGHT;
         controlTurnWeight = static_cast<float>(finalTurnWeight);
 
-    } else {
+    } 
+    else 
+    {
         // 普通循迹：直接使用灰度传感器算出来的转向权重
         finalTurnWeight = turnWeight;
         controlTurnWeight = static_cast<float>(finalTurnWeight);
 
-        if (ENABLE_GRAY_D_CORRECTION && lineSeen) {
-            if (hasGrayDWeight) {
+        if (ENABLE_GRAY_D_CORRECTION && lineSeen) 
+        {
+            if (hasGrayDWeight) 
+            {
                 int deltaWeight = turnWeight - lastGrayDWeight;
                 grayDCorrection = GRAY_D_GAIN * static_cast<float>(deltaWeight);
                 grayDCorrection = constrain(
@@ -450,7 +520,9 @@ void loop() {
 
             lastGrayDWeight = turnWeight;
             hasGrayDWeight = true;
-        } else {
+        } 
+        else 
+        {
             hasGrayDWeight = false;
             lastGrayDWeight = turnWeight;
         }
@@ -494,7 +566,8 @@ void loop() {
     static uint32_t lastTraceMs = 0;
     uint32_t now = millis();
 
-    if (now - lastPrintMs >= PRINT_INTERVAL_MS) {
+    if (now - lastPrintMs >= PRINT_INTERVAL_MS) 
+    {
         lastPrintMs = now;
         Serial.printf(
             "t=%lu gray=%d line=%d hardL=%d hardR=%d lost=%d base=%d grayD=%.2f gyro=%.2f corr=%.2f wifi=%s pkt=%lu age=%lu valid=%d conf=%.2f turn=%d ctrl=%.2f L=%d R=%d\r\n",
@@ -520,7 +593,8 @@ void loop() {
         );
     }
 
-    if (ENABLE_SERIAL_TRACE && now - lastTraceMs >= SERIAL_TRACE_INTERVAL_MS) {
+    if (ENABLE_SERIAL_TRACE && now - lastTraceMs >= SERIAL_TRACE_INTERVAL_MS) 
+    {
         lastTraceMs = now;
         Serial.printf(
             "mpu raw: pred=%.3f near=%.3f far=%.3f gyro=%.2f valid=%d age=%lu packets=%lu parseFail=%lu\n",
