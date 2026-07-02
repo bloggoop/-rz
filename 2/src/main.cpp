@@ -35,10 +35,19 @@ constexpr bool ENABLE_CAMERA = false;
 // =========================
 
 constexpr uint16_t CAMERA_LINK_PORT = 3333;
-constexpr uint32_t TELEMETRY_SEND_INTERVAL_MS = 20;
+constexpr uint32_t TELEMETRY_SEND_INTERVAL_MS = 300;
 
 IPAddress TELEMETRY_BROADCAST_IP(192, 168, 4, 255);
 WiFiUDP telemetryUdp;
+
+// =========================
+// UART 发给 V1 主控板
+// =========================
+
+constexpr bool ENABLE_V1_UART_LINK = true;
+constexpr int V1_UART_TX_PIN = 45;
+constexpr int V1_UART_RX_PIN = 46;
+constexpr uint32_t V1_UART_BAUD = 115200;
 
 // =========================
 // MPU6050
@@ -64,10 +73,12 @@ static bool mpuReady = false;
 static uint32_t captureCount = 0;
 static uint32_t telemetryCount = 0;
 static uint32_t lastTelemetryMs = 0;
+static uint32_t uartTelemetrySeq = 0;
 
 static float gyroZBiasDps = 0.0f;
 static float gyroZDps = 0.0f;
 static float filteredGyroZDps = 0.0f;
+HardwareSerial v1Uart(1);
 
 // =========================
 // MPU 底层
@@ -75,6 +86,8 @@ static float filteredGyroZDps = 0.0f;
 
 static bool mpuWriteReg(uint8_t reg, uint8_t value)
 {
+    Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 50000);
+    Wire.setClock(50000);
     Wire.beginTransmission(MPU6050_ADDR);
     Wire.write(reg);
     Wire.write(value);
@@ -83,6 +96,8 @@ static bool mpuWriteReg(uint8_t reg, uint8_t value)
 
 static bool mpuReadRegs(uint8_t reg, uint8_t *buf, size_t len)
 {
+    Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 50000);
+    Wire.setClock(50000);
     Wire.beginTransmission(MPU6050_ADDR);
     Wire.write(reg);
 
@@ -125,7 +140,8 @@ static bool readGyroZRaw(int16_t &gzRaw)
 
 static bool initMPU()
 {
-    Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 400000);
+    Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 50000);
+    Wire.setClock(50000);
     delay(100);
 
     uint8_t who = 0;
@@ -213,6 +229,46 @@ static void updateMPU()
         (1.0f - MPU_GYRO_Z_FILTER) * gyroZDps;
 }
 
+static uint8_t telemetryChecksum(const char *text)
+{
+    uint8_t value = 0;
+
+    while (*text != '\0') {
+        value ^= static_cast<uint8_t>(*text);
+        text++;
+    }
+
+    return value;
+}
+
+static void sendV1Packet(const char *body)
+{
+    uint8_t crc = telemetryChecksum(body);
+    v1Uart.printf("%s*%02X\n", body, crc);
+}
+
+static void sendV1ImuTelemetry(float gyroDps, int valid)
+{
+    char body[80];
+    uartTelemetrySeq++;
+
+    if (valid == 0) {
+        gyroDps = 0.0f;
+    }
+
+    snprintf(
+        body,
+        sizeof(body),
+        "IMU,%lu,%.2f,%.2f,%.2f",
+        static_cast<unsigned long>(uartTelemetrySeq),
+        0.0f,
+        0.0f,
+        gyroDps
+    );
+
+    sendV1Packet(body);
+}
+
 // =========================
 // UDP
 // =========================
@@ -226,30 +282,27 @@ static void sendTelemetryPacket()
     }
 
     lastTelemetryMs = now;
-
-    char payload[128];
+    Wire.setClock(50000);
 
     int valid = mpuReady ? 1 : 0;
-    int lostCount = 0;
-    float confidence = mpuReady ? 1.0f : 0.0f;
 
-    // 格式：
-    // P,prediction,nearOffset,farOffset,gyroZ,valid,lostCount,confidence
-    snprintf(
-        payload,
-        sizeof(payload),
-        "P,%.3f,%.3f,%.3f,%.3f,%d,%d,%.3f",
-        0.0f,
-        0.0f,
-        0.0f,
-        filteredGyroZDps,
-        valid,
-        lostCount,
-        confidence
-    );
+    if (ENABLE_V1_UART_LINK) {
+        sendV1ImuTelemetry(filteredGyroZDps, valid);
+    }
+
+    static uint32_t lastUartDebugMs = 0;
+    if (now - lastUartDebugMs >= 1000) {
+        lastUartDebugMs = now;
+        Serial.printf(
+            "S3 -> V1 UART TX GPIO%d: gyro=%.1f valid=%d\r\n",
+            V1_UART_TX_PIN,
+            filteredGyroZDps,
+            valid
+        );
+    }
 
     telemetryUdp.beginPacket(TELEMETRY_BROADCAST_IP, CAMERA_LINK_PORT);
-    telemetryUdp.write(reinterpret_cast<const uint8_t *>(payload), strlen(payload));
+    telemetryUdp.printf("G,%.1f,%d", filteredGyroZDps, valid);
     telemetryUdp.endPacket();
 
     telemetryCount++;
@@ -262,8 +315,12 @@ static void sendTelemetryPacket()
 static bool initCamera()
 {
     if (!ENABLE_CAMERA) {
-        Serial.println("Camera disabled by switch");
+        Serial.println("Camera disabled by code switch");
         return false;
+    }
+
+    if (cameraReady) {
+        return true;
     }
 
     camera_config_t config = {};
@@ -351,6 +408,8 @@ static void handleRoot()
     const statusEl = document.getElementById('status');
     const imuEl = document.getElementById('imu');
     let count = 0;
+    let cameraEnabled = false;
+    let frameLoopStarted = false;
 
     function nextFrame() {
       frame.src = '/binary?t=' + Date.now();
@@ -360,10 +419,23 @@ static void handleRoot()
       try {
         const r = await fetch('/imu?t=' + Date.now());
         const j = await r.json();
+        cameraEnabled = j.cameraEnabled;
         imuEl.textContent =
           'MPU: ' + (j.mpuReady ? 'ok' : 'fail') +
           ' | gyroZ: ' + j.gyroZ.toFixed(2) + ' deg/s' +
+          ' | camera: ' + (j.cameraReady ? 'ok' : 'off') +
           ' | udp: ' + j.telemetryCount;
+
+        if (cameraEnabled && !frameLoopStarted) {
+          frameLoopStarted = true;
+          statusEl.classList.remove('disabled');
+          nextFrame();
+        } else if (!cameraEnabled) {
+          frame.removeAttribute('src');
+          statusEl.textContent = 'Camera disabled by code switch';
+          statusEl.classList.add('disabled');
+          frameLoopStarted = false;
+        }
       } catch (e) {
         imuEl.textContent = 'IMU read failed';
       }
@@ -371,17 +443,19 @@ static void handleRoot()
       setTimeout(updateImu, 200);
     }
 
-    const cameraEnabled = false;
-
     frame.onload = () => {
       count++;
       statusEl.textContent = 'Frames loaded: ' + count;
-      setTimeout(nextFrame, 120);
+      if (cameraEnabled) {
+        setTimeout(nextFrame, 120);
+      }
     };
 
     frame.onerror = () => {
       statusEl.textContent = 'Frame failed, retrying...';
-      setTimeout(nextFrame, 1000);
+      if (cameraEnabled) {
+        setTimeout(nextFrame, 1000);
+      }
     };
 
     if (cameraEnabled) {
@@ -389,7 +463,7 @@ static void handleRoot()
     } else {
       frame.alt = 'camera disabled';
       frame.removeAttribute('src');
-      statusEl.textContent = 'Camera disabled by switch';
+      statusEl.textContent = 'Camera disabled by code switch';
       statusEl.classList.add('disabled');
     }
 
@@ -404,17 +478,19 @@ static void handleRoot()
 
 static void handleImu()
 {
-    char json[192];
+    char json[256];
 
     snprintf(
         json,
         sizeof(json),
-        "{\"mpuReady\":%s,\"gyroZ\":%.3f,\"rawGyroZ\":%.3f,\"bias\":%.3f,\"telemetryCount\":%lu}",
+        "{\"mpuReady\":%s,\"gyroZ\":%.3f,\"rawGyroZ\":%.3f,\"bias\":%.3f,\"telemetryCount\":%lu,\"cameraEnabled\":%s,\"cameraReady\":%s}",
         mpuReady ? "true" : "false",
         filteredGyroZDps,
         gyroZDps,
         gyroZBiasDps,
-        static_cast<unsigned long>(telemetryCount)
+        static_cast<unsigned long>(telemetryCount),
+        ENABLE_CAMERA ? "true" : "false",
+        cameraReady ? "true" : "false"
     );
 
     server.send(200, "application/json", json);
@@ -551,6 +627,16 @@ void setup()
     }
 
     mpuReady = initMPU();
+
+    if (ENABLE_V1_UART_LINK) {
+        v1Uart.begin(V1_UART_BAUD, SERIAL_8N1, V1_UART_RX_PIN, V1_UART_TX_PIN);
+        Serial.printf(
+            "V1 UART telemetry: TX=GPIO%d RX=GPIO%d baud=%lu\r\n",
+            V1_UART_TX_PIN,
+            V1_UART_RX_PIN,
+            static_cast<unsigned long>(V1_UART_BAUD)
+        );
+    }
 
     if (!mpuReady) {
         Serial.println("MPU failed. Camera still runs.");

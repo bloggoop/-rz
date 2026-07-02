@@ -1,6 +1,5 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
+#include <Wire.h>
 #include <math.h>
 #include <stdio.h>
 #include "params.h"
@@ -102,12 +101,18 @@ public:
     BreathingLed(int pin, int ch) : ledPin(pin), pwmCh(ch) {}
 
     void begin() {
+        if (ledPin < 0) {
+            return;
+        }
         ledcSetup(pwmCh, LED_PWM_FREQ, PWM_RESOLUTION);
         ledcAttachPin(ledPin, pwmCh);
         ledcWrite(pwmCh, 0);
     }
 
     void update() {
+        if (ledPin < 0) {
+            return;
+        }
         duty += step;
 
         if (duty >= PWM_MAX) {
@@ -122,6 +127,9 @@ public:
     }
 
     void off() {
+        if (ledPin < 0) {
+            return;
+        }
         ledcWrite(pwmCh, 0);
     }
 
@@ -191,6 +199,9 @@ struct MpuTelemetry {
     uint32_t lastUpdateMs = 0;
     uint32_t packetCount = 0;
     uint32_t parseFailCount = 0;
+    uint32_t byteCount = 0;
+    int imuSeq = 0;
+    int camSeq = 0;
 };
 
 Motor leftMotor(LEFT_MOTOR_PINS[0], LEFT_MOTOR_PINS[1], 0, 1, true);
@@ -201,10 +212,172 @@ Encoder rightEncoder(RIGHT_ENCODER_PINS[0], RIGHT_ENCODER_PINS[1]);
 
 BreathingLed led(LED_PIN, 4);
 GraySensorArray gray;
-WiFiUDP telemetryUdp;
 MpuTelemetry mpuTelemetry;
-bool wifiConnected = false;
-uint32_t lastWifiRetryMs = 0;
+HardwareSerial telemetrySerial(1);
+char telemetryLine[128];
+size_t telemetryLineLen = 0;
+uint32_t lastTelemetryByteMs = 0;
+int activeTelemetryRxPin = TELEMETRY_UART_RX_PIN;
+uint32_t lastTelemetryProbeMs = 0;
+volatile bool hasI2CTelemetryLine = false;
+char i2cTelemetryLine[128];
+bool i2cPinSwap = false;
+uint32_t lastI2CReprobeMs = 0;
+uint8_t telemetryRawSample[48];
+size_t telemetryRawSampleLen = 0;
+int lastPulseLevel = HIGH;
+uint32_t pulseLowStartMs = 0;
+uint32_t lastPulseEdgeMs = 0;
+int pulseState = 0;
+int pulseSign = 1;
+int pulseCount = 0;
+
+static void resetTelemetryRawSample()
+{
+    telemetryRawSampleLen = 0;
+}
+
+static void recordTelemetryRawByte(uint8_t value)
+{
+    if (telemetryRawSampleLen < sizeof(telemetryRawSample)) {
+        telemetryRawSample[telemetryRawSampleLen++] = value;
+    }
+}
+
+static void printTelemetryRawSample(const char *prefix)
+{
+    if (telemetryRawSampleLen == 0) {
+        return;
+    }
+
+    Serial.printf("%s RX=%d raw:", prefix, activeTelemetryRxPin);
+
+    for (size_t i = 0; i < telemetryRawSampleLen; i++) {
+        Serial.printf(" %02X", telemetryRawSample[i]);
+    }
+
+    Serial.print(" ascii='");
+
+    for (size_t i = 0; i < telemetryRawSampleLen; i++) {
+        char c = static_cast<char>(telemetryRawSample[i]);
+        Serial.print((c >= 32 && c <= 126) ? c : '.');
+    }
+
+    Serial.println("'");
+}
+
+static uint8_t telemetryChecksum(const char *text)
+{
+    uint8_t value = 0;
+
+    while (*text != '\0') {
+        value ^= static_cast<uint8_t>(*text);
+        text++;
+    }
+
+    return value;
+}
+
+static bool splitTelemetryPacket(const char *packet, char *body, size_t bodySize)
+{
+    if (bodySize == 0) {
+        return false;
+    }
+
+    const char *star = strrchr(packet, '*');
+
+    if (star == nullptr) {
+        strncpy(body, packet, bodySize);
+        body[bodySize - 1] = '\0';
+        return true;
+    }
+
+    size_t bodyLen = static_cast<size_t>(star - packet);
+
+    if (bodyLen >= bodySize) {
+        mpuTelemetry.parseFailCount++;
+        return false;
+    }
+
+    memcpy(body, packet, bodyLen);
+    body[bodyLen] = '\0';
+
+    char *end = nullptr;
+    unsigned long received = strtoul(star + 1, &end, 16);
+
+    if (end == star + 1 || received > 0xFF) {
+        mpuTelemetry.parseFailCount++;
+        return false;
+    }
+
+    uint8_t expected = telemetryChecksum(body);
+
+    if (static_cast<uint8_t>(received) != expected) {
+        mpuTelemetry.parseFailCount++;
+
+        static uint32_t lastCrcPrintMs = 0;
+        uint32_t now = millis();
+
+        if (now - lastCrcPrintMs >= 1000) {
+            lastCrcPrintMs = now;
+            Serial.printf("Telemetry CRC fail: '%s' expected=%02X\r\n", packet, expected);
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+static bool parseS3CamTelemetryBody(const char *body)
+{
+    int seq = 0;
+    float pitch = 0.0f;
+    float roll = 0.0f;
+    float yawOrGyro = 0.0f;
+
+    if (sscanf(body, "IMU,%d,%f,%f,%f", &seq, &pitch, &roll, &yawOrGyro) == 4) {
+        if (mpuTelemetry.imuSeq > 0 && seq > mpuTelemetry.imuSeq + 1) {
+            mpuTelemetry.lostCount += seq - mpuTelemetry.imuSeq - 1;
+        }
+
+        mpuTelemetry.imuSeq = seq;
+        mpuTelemetry.valid = true;
+        mpuTelemetry.gyroZDps = yawOrGyro;
+        mpuTelemetry.confidence = 1.0f;
+        mpuTelemetry.prediction = yawOrGyro;
+        mpuTelemetry.nearOffset = 0.0f;
+        mpuTelemetry.farOffset = 0.0f;
+        mpuTelemetry.lastUpdateMs = millis();
+        mpuTelemetry.packetCount++;
+        return true;
+    }
+
+    int camSeq = 0;
+    float nearOffset = 0.0f;
+    float farOffset = 0.0f;
+    float curve = 0.0f;
+    float quality = 0.0f;
+
+    if (sscanf(body, "CAM,%d,%f,%f,%f,%f", &camSeq, &nearOffset, &farOffset, &curve, &quality) == 5) {
+        if (mpuTelemetry.camSeq > 0 && camSeq > mpuTelemetry.camSeq + 1) {
+            mpuTelemetry.lostCount += camSeq - mpuTelemetry.camSeq - 1;
+        }
+
+        mpuTelemetry.camSeq = camSeq;
+        mpuTelemetry.valid = quality > 0.0f;
+        mpuTelemetry.gyroZDps = 0.0f;
+        mpuTelemetry.confidence = constrain(quality, 0.0f, 1.0f);
+        mpuTelemetry.prediction = constrain(curve, -1.0f, 1.0f);
+        mpuTelemetry.nearOffset = constrain(nearOffset, -1.0f, 1.0f);
+        mpuTelemetry.farOffset = constrain(farOffset, -1.0f, 1.0f);
+        mpuTelemetry.lastUpdateMs = millis();
+        mpuTelemetry.packetCount++;
+        return true;
+    }
+
+    return false;
+}
 
 // 记录上一次转向方向
 // -1 = 上次偏左
@@ -218,27 +391,349 @@ int lostLineCount = 0;
 int lastGrayDWeight = 0;
 bool hasGrayDWeight = false;
 
-static void connectTelemetryLink()
+static void updateUartRxPinScan()
 {
-    if (!ENABLE_MPU_TELEMETRY) {
-        wifiConnected = false;
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
+    if (!ENABLE_UART_RX_PIN_SCAN) {
         return;
     }
 
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    WiFi.begin(TELEMETRY_AP_SSID, TELEMETRY_AP_PASSWORD);
+    constexpr size_t PIN_COUNT = sizeof(UART_RX_SCAN_PINS) / sizeof(UART_RX_SCAN_PINS[0]);
+    static bool initialized = false;
+    static int lastLevels[PIN_COUNT] = {};
+    static uint32_t edgeCounts[PIN_COUNT] = {};
+    static uint32_t lastReportMs = 0;
 
-    wifiConnected = (WiFi.status() == WL_CONNECTED);
+    if (!initialized) {
+        for (size_t i = 0; i < PIN_COUNT; i++) {
+            pinMode(UART_RX_SCAN_PINS[i], INPUT);
+            lastLevels[i] = digitalRead(UART_RX_SCAN_PINS[i]);
+            edgeCounts[i] = 0;
+        }
 
-    if (wifiConnected) {
-        telemetryUdp.begin(TELEMETRY_UDP_PORT);
-        Serial.printf("Telemetry WiFi connected, IP=%s\r\n", WiFi.localIP().toString().c_str());
-    } else {
-        Serial.println("Telemetry WiFi connecting...");
+        initialized = true;
+        lastReportMs = millis();
     }
+
+    for (size_t i = 0; i < PIN_COUNT; i++) {
+        int level = digitalRead(UART_RX_SCAN_PINS[i]);
+
+        if (level != lastLevels[i]) {
+            lastLevels[i] = level;
+            edgeCounts[i]++;
+        }
+    }
+
+    uint32_t now = millis();
+
+    if (now - lastReportMs < UART_RX_SCAN_INTERVAL_MS) {
+        return;
+    }
+
+    lastReportMs = now;
+    Serial.print("uart rx scan edges:");
+
+    for (size_t i = 0; i < PIN_COUNT; i++) {
+        Serial.printf(" GPIO%d=%lu", UART_RX_SCAN_PINS[i], static_cast<unsigned long>(edgeCounts[i]));
+        edgeCounts[i] = 0;
+    }
+
+    Serial.println();
+}
+
+static void parseTelemetryLine(const char *packet)
+{
+    if (!ENABLE_MPU_TELEMETRY) {
+        return;
+    }
+
+    char body[128];
+
+    if (!splitTelemetryPacket(packet, body, sizeof(body))) {
+        return;
+    }
+
+    if (strncmp(body, "IMU,", 4) == 0 || strncmp(body, "CAM,", 4) == 0) {
+        if (parseS3CamTelemetryBody(body)) {
+            return;
+        }
+
+        mpuTelemetry.parseFailCount++;
+        return;
+    }
+
+    char tag = '\0';
+    float prediction = 0.0f;
+    float nearOffset = 0.0f;
+    float farOffset = 0.0f;
+    float gyroZ = 0.0f;
+    int valid = 0;
+    int lostCount = 0;
+    float confidence = 0.0f;
+
+    int matched = sscanf(
+        body,
+        " %c,%f,%f,%f,%f,%d,%d,%f",
+        &tag,
+        &prediction,
+        &nearOffset,
+        &farOffset,
+        &gyroZ,
+        &valid,
+        &lostCount,
+        &confidence
+    );
+
+    if (tag == 'G') {
+        int gyroTenths = 0;
+        int compactValid = 0;
+
+        matched = sscanf(body, " G,%d,%d", &gyroTenths, &compactValid);
+
+        if (matched >= 2) {
+            mpuTelemetry.valid = (compactValid != 0);
+            mpuTelemetry.gyroZDps = static_cast<float>(gyroTenths) / 10.0f;
+            mpuTelemetry.confidence = compactValid != 0 ? 1.0f : 0.0f;
+            mpuTelemetry.prediction = 0.0f;
+            mpuTelemetry.nearOffset = 0.0f;
+            mpuTelemetry.farOffset = 0.0f;
+            mpuTelemetry.lostCount = 0;
+            mpuTelemetry.lastUpdateMs = millis();
+            mpuTelemetry.packetCount++;
+            return;
+        }
+    }
+
+    if (matched >= 5 && tag == 'P') {
+        mpuTelemetry.valid = (valid != 0);
+        mpuTelemetry.gyroZDps = gyroZ;
+        mpuTelemetry.confidence = confidence;
+        mpuTelemetry.prediction = prediction;
+        mpuTelemetry.nearOffset = nearOffset;
+        mpuTelemetry.farOffset = farOffset;
+        mpuTelemetry.lostCount = lostCount;
+        mpuTelemetry.lastUpdateMs = millis();
+        mpuTelemetry.packetCount++;
+    } else {
+        mpuTelemetry.parseFailCount++;
+
+        static uint32_t lastBadPacketPrintMs = 0;
+        uint32_t now = millis();
+
+        if (now - lastBadPacketPrintMs >= 1000) {
+            lastBadPacketPrintMs = now;
+            Serial.printf("Telemetry parse fail on RX=%d: '", activeTelemetryRxPin);
+
+            for (size_t i = 0; packet[i] != '\0' && i < 80; i++) {
+                char c = packet[i];
+                if (c >= 32 && c <= 126) {
+                    Serial.print(c);
+                } else {
+                    Serial.printf("\\x%02X", static_cast<unsigned char>(c));
+                }
+            }
+
+            Serial.println("'");
+        }
+    }
+}
+
+static void configureI2CTelemetrySlave()
+{
+    int sdaPin = i2cPinSwap ? TELEMETRY_I2C_SCL_PIN : TELEMETRY_I2C_SDA_PIN;
+    int sclPin = i2cPinSwap ? TELEMETRY_I2C_SDA_PIN : TELEMETRY_I2C_SCL_PIN;
+
+    Wire.end();
+    Wire.setBufferSize(128);
+    bool started = Wire.begin(
+        TELEMETRY_I2C_ADDR,
+        sdaPin,
+        sclPin,
+        TELEMETRY_I2C_CLOCK
+    );
+    Wire.setTimeOut(50);
+
+    Wire.onReceive([](int len) {
+        size_t index = 0;
+
+        while (Wire.available() > 0 && index < sizeof(i2cTelemetryLine) - 1) {
+            char c = static_cast<char>(Wire.read());
+
+            if (c == '\r' || c == '\n') {
+                continue;
+            }
+
+            i2cTelemetryLine[index++] = c;
+        }
+
+        while (Wire.available() > 0) {
+            Wire.read();
+        }
+
+        i2cTelemetryLine[index] = '\0';
+        hasI2CTelemetryLine = index > 0;
+        mpuTelemetry.byteCount += len;
+    });
+
+    Serial.printf(
+        "Telemetry I2C slave %s: addr=0x%02X SDA=%d SCL=%d%s\r\n",
+        started ? "enabled" : "FAILED",
+        TELEMETRY_I2C_ADDR,
+        sdaPin,
+        sclPin,
+        i2cPinSwap ? " swapped" : ""
+    );
+}
+
+static void beginTelemetryLink()
+{
+    if (!ENABLE_MPU_TELEMETRY) {
+        return;
+    }
+
+    if (ENABLE_PULSE_TELEMETRY) {
+        pinMode(TELEMETRY_UART_RX_PIN, INPUT_PULLUP);
+        lastPulseLevel = digitalRead(TELEMETRY_UART_RX_PIN);
+        Serial.printf(
+            "Telemetry pulse RX enabled: RX=%d\r\n",
+            TELEMETRY_UART_RX_PIN
+        );
+        return;
+    }
+
+    if (ENABLE_I2C_TELEMETRY) {
+        configureI2CTelemetrySlave();
+        return;
+    }
+
+    activeTelemetryRxPin = ENABLE_UART_RX_AUTO_PROBE ? UART_RX_PROBE_PINS[0] : TELEMETRY_UART_RX_PIN;
+
+    if (activeTelemetryRxPin < 0 ||
+        activeTelemetryRxPin > 39 ||
+        TELEMETRY_UART_TX_PIN < 0 ||
+        TELEMETRY_UART_TX_PIN > 39) {
+        Serial.printf(
+            "Telemetry UART disabled: invalid ESP32 pins RX=%d TX=%d\r\n",
+            activeTelemetryRxPin,
+            TELEMETRY_UART_TX_PIN
+        );
+        return;
+    }
+
+    telemetrySerial.begin(
+        TELEMETRY_UART_BAUD,
+        SERIAL_8N1,
+        activeTelemetryRxPin,
+        TELEMETRY_UART_TX_PIN
+    );
+    resetTelemetryRawSample();
+
+    Serial.printf(
+        "Telemetry UART1 enabled: RX=%d TX=%d baud=%lu%s\r\n",
+        activeTelemetryRxPin,
+        TELEMETRY_UART_TX_PIN,
+        static_cast<unsigned long>(TELEMETRY_UART_BAUD),
+        ENABLE_UART_RX_AUTO_PROBE ? " auto-probe" : ""
+    );
+}
+
+static void completePulseTelemetryPacket()
+{
+    float gyro = static_cast<float>(pulseSign * max(0, pulseCount - 1));
+
+    mpuTelemetry.valid = true;
+    mpuTelemetry.gyroZDps = gyro;
+    mpuTelemetry.confidence = 1.0f;
+    mpuTelemetry.prediction = 0.0f;
+    mpuTelemetry.nearOffset = 0.0f;
+    mpuTelemetry.farOffset = 0.0f;
+    mpuTelemetry.lostCount = 0;
+    mpuTelemetry.lastUpdateMs = millis();
+    mpuTelemetry.packetCount++;
+
+    pulseState = 0;
+    pulseCount = 0;
+    pulseSign = 1;
+}
+
+static void updatePulseTelemetryLink()
+{
+    uint32_t now = millis();
+    int level = digitalRead(TELEMETRY_UART_RX_PIN);
+
+    if (level != lastPulseLevel) {
+        if (level == LOW) {
+            pulseLowStartMs = now;
+        } else {
+            uint32_t lowMs = now - pulseLowStartMs;
+
+            if (lowMs >= 220) {
+                pulseState = 1;
+                pulseCount = 0;
+                pulseSign = 1;
+                mpuTelemetry.byteCount++;
+            } else if (pulseState == 1 && lowMs >= 80) {
+                pulseSign = (lowMs >= 150) ? -1 : 1;
+                pulseState = 2;
+                lastPulseEdgeMs = now;
+                mpuTelemetry.byteCount++;
+            } else if (pulseState == 2 && lowMs >= 70) {
+                pulseCount++;
+                lastPulseEdgeMs = now;
+                mpuTelemetry.byteCount++;
+            }
+        }
+
+        lastPulseLevel = level;
+    }
+
+    if (pulseState == 2 && pulseCount > 0 && now - lastPulseEdgeMs >= 500) {
+        completePulseTelemetryPacket();
+    }
+}
+
+static void updateTelemetryRxProbe()
+{
+    if (!ENABLE_MPU_TELEMETRY || !ENABLE_UART_RX_AUTO_PROBE || mpuTelemetry.packetCount > 0) {
+        return;
+    }
+
+    uint32_t now = millis();
+
+    if (now - lastTelemetryProbeMs < UART_RX_PROBE_INTERVAL_MS) {
+        return;
+    }
+
+    lastTelemetryProbeMs = now;
+
+    constexpr size_t PIN_COUNT = sizeof(UART_RX_PROBE_PINS) / sizeof(UART_RX_PROBE_PINS[0]);
+    static size_t probeIndex = 0;
+
+    probeIndex = (probeIndex + 1) % PIN_COUNT;
+    printTelemetryRawSample("Telemetry probe sample");
+    activeTelemetryRxPin = UART_RX_PROBE_PINS[probeIndex];
+
+    if (activeTelemetryRxPin < 0 || activeTelemetryRxPin > 39) {
+        Serial.printf("Telemetry UART probe skipped invalid RX=%d\r\n", activeTelemetryRxPin);
+        return;
+    }
+
+    telemetryLineLen = 0;
+    resetTelemetryRawSample();
+    telemetrySerial.end();
+    telemetrySerial.begin(
+        TELEMETRY_UART_BAUD,
+        SERIAL_8N1,
+        activeTelemetryRxPin,
+        TELEMETRY_UART_TX_PIN
+    );
+
+    Serial.printf(
+        "Telemetry UART probing RX=%d bytes=%lu packets=%lu parseFail=%lu\r\n",
+        activeTelemetryRxPin,
+        static_cast<unsigned long>(mpuTelemetry.byteCount),
+        static_cast<unsigned long>(mpuTelemetry.packetCount),
+        static_cast<unsigned long>(mpuTelemetry.parseFailCount)
+    );
 }
 
 static void updateTelemetryLink()
@@ -247,67 +742,73 @@ static void updateTelemetryLink()
         return;
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-        wifiConnected = false;
-    }
-
-    if (!wifiConnected) {
-        uint32_t now = millis();
-
-        if (now - lastWifiRetryMs >= 3000) {
-            lastWifiRetryMs = now;
-            connectTelemetryLink();
-        }
+    if (ENABLE_PULSE_TELEMETRY) {
+        updatePulseTelemetryLink();
         return;
     }
 
-    int packetSize = telemetryUdp.parsePacket();
+    if (ENABLE_I2C_TELEMETRY) {
+        uint32_t now = millis();
 
-    while (packetSize > 0) {
-        char packet[128];
-        int len = telemetryUdp.read(packet, sizeof(packet) - 1);
-
-        if (len > 0) {
-            packet[len] = '\0';
-
-            char tag = '\0';
-            float prediction = 0.0f;
-            float nearOffset = 0.0f;
-            float farOffset = 0.0f;
-            float gyroZ = 0.0f;
-            int valid = 0;
-            int lostCount = 0;
-            float confidence = 0.0f;
-
-            int matched = sscanf(
-                packet,
-                " %c,%f,%f,%f,%f,%d,%d,%f",
-                &tag,
-                &prediction,
-                &nearOffset,
-                &farOffset,
-                &gyroZ,
-                &valid,
-                &lostCount,
-                &confidence
-            );
-
-            if (matched >= 5 && tag == 'P') {
-                mpuTelemetry.valid = (valid != 0);
-                mpuTelemetry.gyroZDps = gyroZ;
-                mpuTelemetry.confidence = confidence;
-                mpuTelemetry.prediction = prediction;
-                mpuTelemetry.nearOffset = nearOffset;
-                mpuTelemetry.farOffset = farOffset;
-                mpuTelemetry.lostCount = lostCount;
-                mpuTelemetry.lastUpdateMs = millis();
-                mpuTelemetry.packetCount++;
-            } else {
-                mpuTelemetry.parseFailCount++;
-            }
+        if (mpuTelemetry.byteCount == 0 &&
+            mpuTelemetry.packetCount == 0 &&
+            now - lastI2CReprobeMs >= 2500) {
+            lastI2CReprobeMs = now;
+            i2cPinSwap = !i2cPinSwap;
+            configureI2CTelemetrySlave();
         }
 
-        packetSize = telemetryUdp.parsePacket();
+        if (hasI2CTelemetryLine) {
+            char packet[128];
+
+            noInterrupts();
+            strncpy(packet, i2cTelemetryLine, sizeof(packet));
+            packet[sizeof(packet) - 1] = '\0';
+            hasI2CTelemetryLine = false;
+            interrupts();
+
+            parseTelemetryLine(packet);
+        }
+
+        return;
+    }
+
+    while (telemetrySerial.available() > 0) {
+        char c = static_cast<char>(telemetrySerial.read());
+        mpuTelemetry.byteCount++;
+        lastTelemetryByteMs = millis();
+        recordTelemetryRawByte(static_cast<uint8_t>(c));
+
+        if (c == '\r') {
+            continue;
+        }
+
+        if (c == '\n') {
+            telemetryLine[telemetryLineLen] = '\0';
+
+            if (telemetryLineLen > 0) {
+                parseTelemetryLine(telemetryLine);
+            }
+
+            telemetryLineLen = 0;
+            continue;
+        }
+
+        if (telemetryLineLen < sizeof(telemetryLine) - 1) {
+            telemetryLine[telemetryLineLen++] = c;
+        } else {
+            telemetryLineLen = 0;
+            mpuTelemetry.parseFailCount++;
+        }
+    }
+
+    if (telemetryLineLen >= 5 &&
+        (telemetryLine[0] == 'P' || telemetryLine[0] == 'G') &&
+        telemetryLine[1] == ',' &&
+        millis() - lastTelemetryByteMs >= 1000) {
+        telemetryLine[telemetryLineLen] = '\0';
+        parseTelemetryLine(telemetryLine);
+        telemetryLineLen = 0;
     }
 }
 
@@ -333,7 +834,7 @@ void setup() {
     led.begin();
     gray.begin();
 
-    connectTelemetryLink();
+    beginTelemetryLink();
 
     Serial.printf(
         "Gray pins: %d,%d,%d,%d,%d. MPU telemetry: %s\r\n",
@@ -348,6 +849,8 @@ void setup() {
 
 void loop() {
     updateTelemetryLink();
+    updateTelemetryRxProbe();
+    updateUartRxPinScan();
 
     leftEncoder.update();
     rightEncoder.update();
@@ -497,7 +1000,7 @@ void loop() {
     if (now - lastPrintMs >= PRINT_INTERVAL_MS) {
         lastPrintMs = now;
         Serial.printf(
-            "t=%lu gray=%d line=%d hardL=%d hardR=%d lost=%d base=%d grayD=%.2f gyro=%.2f corr=%.2f wifi=%s pkt=%lu age=%lu valid=%d conf=%.2f turn=%d ctrl=%.2f L=%d R=%d\r\n",
+            "t=%lu gray=%d line=%d hardL=%d hardR=%d lost=%d base=%d grayD=%.2f gyro=%.2f corr=%.2f %s=%s rx=%d bytes=%lu pkt=%lu age=%lu valid=%d conf=%.2f turn=%d ctrl=%.2f L=%d R=%d\r\n",
             static_cast<unsigned long>(now),
             turnWeight,
             lineSeen ? 1 : 0,
@@ -508,7 +1011,10 @@ void loop() {
             grayDCorrection,
             mpuTelemetryFresh() ? mpuTelemetry.gyroZDps : 0.0f,
             gyroCorrection,
-            wifiConnected ? "ok" : "fail",
+            ENABLE_I2C_TELEMETRY ? "i2c" : "uart",
+            mpuTelemetryFresh() ? "ok" : "wait",
+            activeTelemetryRxPin,
+            static_cast<unsigned long>(mpuTelemetry.byteCount),
             static_cast<unsigned long>(mpuTelemetry.packetCount),
             mpuTelemetry.valid ? static_cast<unsigned long>(now - mpuTelemetry.lastUpdateMs) : 0UL,
             mpuTelemetry.valid ? 1 : 0,
@@ -523,13 +1029,15 @@ void loop() {
     if (ENABLE_SERIAL_TRACE && now - lastTraceMs >= SERIAL_TRACE_INTERVAL_MS) {
         lastTraceMs = now;
         Serial.printf(
-            "mpu raw: pred=%.3f near=%.3f far=%.3f gyro=%.2f valid=%d age=%lu packets=%lu parseFail=%lu\n",
+            "mpu raw: pred=%.3f near=%.3f far=%.3f gyro=%.2f valid=%d age=%lu rx=%d bytes=%lu packets=%lu parseFail=%lu\n",
             mpuTelemetry.prediction,
             mpuTelemetry.nearOffset,
             mpuTelemetry.farOffset,
             mpuTelemetry.gyroZDps,
             mpuTelemetry.valid ? 1 : 0,
             mpuTelemetry.valid ? static_cast<unsigned long>(now - mpuTelemetry.lastUpdateMs) : 0UL,
+            activeTelemetryRxPin,
+            static_cast<unsigned long>(mpuTelemetry.byteCount),
             static_cast<unsigned long>(mpuTelemetry.packetCount),
             static_cast<unsigned long>(mpuTelemetry.parseFailCount)
         );
