@@ -1,9 +1,9 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
 #include <WebServer.h>
 #include <Wire.h>
 #include <math.h>
+#include <string.h>
 #include "esp_camera.h"
 
 // Camera pins for the board that already worked in the serial JPEG test.
@@ -28,17 +28,28 @@ constexpr char AP_SSID[] = "ESP32S3-CAM";
 constexpr char AP_PASSWORD[] = "12345678";
 
 constexpr uint8_t BINARY_THRESHOLD = 128;
-constexpr bool ENABLE_CAMERA = false;
+constexpr bool TRACK_LINE_IS_DARK = true;
+constexpr bool ENABLE_CAMERA = true;
+constexpr framesize_t CAMERA_FRAME_SIZE = FRAMESIZE_QQVGA;
+constexpr uint32_t CAMERA_XCLK_HZ = 24000000;
 
-// =========================
-// UDP 发给 V1 主控板
-// =========================
-
-constexpr uint16_t CAMERA_LINK_PORT = 3333;
 constexpr uint32_t TELEMETRY_SEND_INTERVAL_MS = 300;
+constexpr uint32_t VISION_PROCESS_INTERVAL_MS = 30;
+constexpr uint32_t VISION_UART_SEND_INTERVAL_MS = 30;
 
-IPAddress TELEMETRY_BROADCAST_IP(192, 168, 4, 255);
-WiFiUDP telemetryUdp;
+constexpr uint8_t VISION_SAMPLE_ROWS = 9;
+constexpr uint8_t VISION_BLACK_MIN_PIXELS = 12;
+constexpr uint8_t VISION_MIN_ROW_CONTRAST = 24;
+constexpr uint8_t VISION_MIN_SEGMENT_PIXELS = 10;
+constexpr float VISION_SEARCH_LEFT_RATIO = 0.18f;
+constexpr float VISION_SEARCH_RIGHT_RATIO = 0.82f;
+constexpr float VISION_EXPECTED_LINE_WIDTH_RATIO = 0.18f;
+constexpr float VISION_CENTER_STABILITY_FULL_SCALE = 0.28f;
+constexpr uint8_t VISION_STRAIGHT_MIN_ROWS = 7;
+constexpr float VISION_STRAIGHT_MAX_END_DIFF = 0.16f;
+constexpr float VISION_STRAIGHT_MAX_RESIDUAL = 0.055f;
+constexpr float VISION_STRAIGHT_MAX_ROW_JUMP = 0.14f;
+constexpr float VISION_LINE_FOUND_MIN_QUALITY = 0.35f;
 
 // =========================
 // UART 发给 V1 主控板
@@ -56,7 +67,8 @@ constexpr uint32_t V1_UART_BAUD = 115200;
 constexpr int MPU_SDA_PIN = 47;
 constexpr int MPU_SCL_PIN = 21;
 
-constexpr uint8_t MPU6050_ADDR = 0x68;
+constexpr uint8_t MPU6050_ADDR_LOW = 0x68;
+constexpr uint8_t MPU6050_ADDR_HIGH = 0x69;
 
 // 如果 V1 上阻尼方向反了，优先改 V1 的 GYRO_Z_SIGN。
 // 这里一般保持 1.0。
@@ -67,18 +79,66 @@ constexpr float MPU_GYRO_Z_FILTER = 0.75f;
 
 WebServer server(80);
 
+enum class RoadType : uint8_t {
+    Unknown = 0,
+    Straight = 1,
+    SCurve = 2,
+    RightAngle = 3,
+    NormalCurve = 4,
+};
+
 static bool cameraReady = false;
 static bool mpuReady = false;
 
 static uint32_t captureCount = 0;
+static uint32_t visionCount = 0;
 static uint32_t telemetryCount = 0;
 static uint32_t lastTelemetryMs = 0;
+static uint32_t lastVisionMs = 0;
+static uint32_t lastVisionUartMs = 0;
 static uint32_t uartTelemetrySeq = 0;
+static uint32_t latestGrayFrameId = 0;
+static uint32_t latestGrayFrameWidth = 0;
+static uint32_t latestGrayFrameHeight = 0;
 
 static float gyroZBiasDps = 0.0f;
 static float gyroZDps = 0.0f;
 static float filteredGyroZDps = 0.0f;
-HardwareSerial v1Uart(1);
+HardwareSerial linkUart(1);
+static uint8_t mpuAddr = MPU6050_ADDR_LOW;
+static float visionFps = 0.0f;
+static uint8_t latestGrayFrame[160 * 120] = {};
+
+struct VisionResult {
+    RoadType type = RoadType::Unknown;
+    int validRows = 0;
+    float centerOffset = 0.0f;
+    float topOffset = 0.0f;
+    float bottomOffset = 0.0f;
+    float meanResidual = 0.0f;
+    float maxJump = 0.0f;
+    float confidence = 0.0f;
+    uint32_t frameId = 0;
+    uint32_t lastUpdateMs = 0;
+};
+
+static VisionResult vision;
+
+static const char *roadTypeName(RoadType type)
+{
+    switch (type) {
+    case RoadType::Straight:
+        return "straight";
+    case RoadType::SCurve:
+        return "s_curve";
+    case RoadType::RightAngle:
+        return "right_angle";
+    case RoadType::NormalCurve:
+        return "normal_curve";
+    default:
+        return "unknown";
+    }
+}
 
 // =========================
 // MPU 底层
@@ -86,9 +146,8 @@ HardwareSerial v1Uart(1);
 
 static bool mpuWriteReg(uint8_t reg, uint8_t value)
 {
-    Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 50000);
     Wire.setClock(50000);
-    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.beginTransmission(mpuAddr);
     Wire.write(reg);
     Wire.write(value);
     return Wire.endTransmission() == 0;
@@ -96,17 +155,18 @@ static bool mpuWriteReg(uint8_t reg, uint8_t value)
 
 static bool mpuReadRegs(uint8_t reg, uint8_t *buf, size_t len)
 {
-    Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 50000);
     Wire.setClock(50000);
-    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.beginTransmission(mpuAddr);
     Wire.write(reg);
 
-    if (Wire.endTransmission(false) != 0) {
+    if (Wire.endTransmission() != 0) {
         return false;
     }
 
+    delay(2);
+
     size_t got = Wire.requestFrom(
-        static_cast<int>(MPU6050_ADDR),
+        static_cast<int>(mpuAddr),
         static_cast<int>(len)
     );
 
@@ -142,21 +202,37 @@ static bool initMPU()
 {
     Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN, 50000);
     Wire.setClock(50000);
+    Wire.setTimeOut(50);
     delay(100);
 
     uint8_t who = 0;
+    const uint8_t candidates[] = {MPU6050_ADDR_LOW, MPU6050_ADDR_HIGH};
+    bool found = false;
 
-    if (!mpuReadRegs(0x75, &who, 1)) {
-        Serial.println("MPU6050 not found: I2C read failed");
+    for (size_t i = 0; i < sizeof(candidates); i++) {
+        mpuAddr = candidates[i];
+        who = 0;
+
+        bool ok = mpuReadRegs(0x75, &who, 1);
+        Serial.printf(
+            "MPU6050 probe addr=0x%02X read=%s WHO_AM_I=0x%02X\r\n",
+            mpuAddr,
+            ok ? "ok" : "fail",
+            who
+        );
+
+        if (ok && (who == 0x68 || who == 0x70)) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        Serial.println("MPU6050 not found at 0x68 or 0x69");
         return false;
     }
 
-    Serial.printf("MPU6050 WHO_AM_I = 0x%02X\r\n", who);
-
-    if (who != 0x68 && who != 0x70) {
-        Serial.println("MPU6050 WHO_AM_I unexpected");
-        return false;
-    }
+    Serial.printf("MPU6050 attached at addr=0x%02X WHO_AM_I=0x%02X\r\n", mpuAddr, who);
 
     mpuWriteReg(0x6B, 0x00);
     delay(50);
@@ -244,7 +320,23 @@ static uint8_t telemetryChecksum(const char *text)
 static void sendV1Packet(const char *body)
 {
     uint8_t crc = telemetryChecksum(body);
-    v1Uart.printf("%s*%02X\n", body, crc);
+    linkUart.printf("%s*%02X\n", body, crc);
+}
+
+static void beginV1UartLink()
+{
+    if (!ENABLE_V1_UART_LINK) {
+        return;
+    }
+
+    linkUart.begin(V1_UART_BAUD, SERIAL_8N1, V1_UART_RX_PIN, V1_UART_TX_PIN);
+
+    Serial.printf(
+        "V1 UART telemetry: uart=1 TX=GPIO%d RX=GPIO%d baud=%lu\r\n",
+        V1_UART_TX_PIN,
+        V1_UART_RX_PIN,
+        static_cast<unsigned long>(V1_UART_BAUD)
+    );
 }
 
 static void sendV1ImuTelemetry(float gyroDps, int valid)
@@ -269,9 +361,25 @@ static void sendV1ImuTelemetry(float gyroDps, int valid)
     sendV1Packet(body);
 }
 
-// =========================
-// UDP
-// =========================
+static void sendV1VisionTelemetry(const VisionResult &result)
+{
+    char body[80];
+    uartTelemetrySeq++;
+
+    // CAM: near/far are image-center-relative offsets; curve carries the center-error target.
+    snprintf(
+        body,
+        sizeof(body),
+        "CAM,%lu,%.3f,%.3f,%.3f,%.2f",
+        static_cast<unsigned long>(uartTelemetrySeq),
+        result.bottomOffset,
+        result.topOffset,
+        result.centerOffset,
+        result.confidence
+    );
+
+    sendV1Packet(body);
+}
 
 static void sendTelemetryPacket()
 {
@@ -290,22 +398,316 @@ static void sendTelemetryPacket()
         sendV1ImuTelemetry(filteredGyroZDps, valid);
     }
 
-    static uint32_t lastUartDebugMs = 0;
-    if (now - lastUartDebugMs >= 1000) {
-        lastUartDebugMs = now;
-        Serial.printf(
-            "S3 -> V1 UART TX GPIO%d: gyro=%.1f valid=%d\r\n",
-            V1_UART_TX_PIN,
-            filteredGyroZDps,
-            valid
-        );
+    telemetryCount++;
+}
+
+// =========================
+// Vision
+// =========================
+
+static float absf(float value)
+{
+    return value < 0.0f ? -value : value;
+}
+
+static bool isTrackPixel(uint8_t gray, uint8_t threshold)
+{
+    return TRACK_LINE_IS_DARK ? gray < threshold : gray >= threshold;
+}
+
+static bool findLineCenterInRow(
+    const uint8_t *row,
+    uint32_t width,
+    float &normalizedCenter,
+    int &centerX,
+    uint16_t &segmentPixels
+)
+{
+    uint8_t minGray = 255;
+    uint8_t maxGray = 0;
+
+    for (uint32_t x = 0; x < width; x++) {
+        uint8_t gray = row[x];
+
+        if (gray < minGray) {
+            minGray = gray;
+        }
+
+        if (gray > maxGray) {
+            maxGray = gray;
+        }
     }
 
-    telemetryUdp.beginPacket(TELEMETRY_BROADCAST_IP, CAMERA_LINK_PORT);
-    telemetryUdp.printf("G,%.1f,%d", filteredGyroZDps, valid);
-    telemetryUdp.endPacket();
+    uint8_t threshold = BINARY_THRESHOLD;
 
-    telemetryCount++;
+    if (maxGray - minGray >= VISION_MIN_ROW_CONTRAST) {
+        threshold = static_cast<uint8_t>((static_cast<uint16_t>(minGray) + maxGray) / 2);
+    }
+
+    const int searchStart = constrain(
+        static_cast<int>(width * VISION_SEARCH_LEFT_RATIO),
+        0,
+        static_cast<int>(width) - 1
+    );
+    const int searchEnd = constrain(
+        static_cast<int>(width * VISION_SEARCH_RIGHT_RATIO),
+        searchStart,
+        static_cast<int>(width) - 1
+    );
+    int bestStart = -1;
+    int bestEnd = -1;
+    int bestScore = -1000000;
+    int runStart = -1;
+    const int imageCenterX = static_cast<int>(width / 2);
+
+    for (int x = searchStart; x <= searchEnd; x++) {
+        int blackVotes = 0;
+        int samples = 0;
+
+        for (int dx = -2; dx <= 2; dx++) {
+            int nx = x + dx;
+
+            if (nx >= 0 && nx < static_cast<int>(width)) {
+                samples++;
+
+                if (isTrackPixel(row[nx], threshold)) {
+                    blackVotes++;
+                }
+            }
+        }
+
+        bool denoisedBlack = blackVotes >= 3 && samples >= 3;
+
+        if (denoisedBlack) {
+            if (runStart < 0) {
+                runStart = x;
+            }
+        } else if (runStart >= 0) {
+            int runEnd = x - 1;
+            int runLen = runEnd - runStart + 1;
+
+            if (runLen >= VISION_MIN_SEGMENT_PIXELS) {
+                int runCenter = (runStart + runEnd) / 2;
+                int distancePenalty = abs(runCenter - imageCenterX);
+                int score = runLen * 12 - distancePenalty * 2;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestStart = runStart;
+                    bestEnd = runEnd;
+                }
+            }
+
+            runStart = -1;
+        }
+    }
+
+    if (runStart >= 0) {
+        int runEnd = searchEnd;
+        int runLen = runEnd - runStart + 1;
+
+        if (runLen >= VISION_MIN_SEGMENT_PIXELS) {
+            int runCenter = (runStart + runEnd) / 2;
+            int distancePenalty = abs(runCenter - imageCenterX);
+            int score = runLen * 12 - distancePenalty * 2;
+
+            if (score > bestScore) {
+                bestStart = runStart;
+                bestEnd = runEnd;
+            }
+        }
+    }
+
+    if (bestStart < 0 || bestEnd < bestStart) {
+        return false;
+    }
+
+    segmentPixels = static_cast<uint16_t>(bestEnd - bestStart + 1);
+
+    if (segmentPixels < VISION_BLACK_MIN_PIXELS) {
+        return false;
+    }
+
+    centerX = (bestStart + bestEnd) / 2;
+    float center = static_cast<float>(centerX);
+    float halfWidth = static_cast<float>(width - 1) * 0.5f;
+    normalizedCenter = (center - halfWidth) / halfWidth;
+
+    return true;
+}
+
+static VisionResult analyzeBinaryRoad(camera_fb_t *fb)
+{
+    VisionResult result;
+    result.frameId = visionCount + 1;
+    result.lastUpdateMs = millis();
+
+    if (fb == nullptr || fb->format != PIXFORMAT_GRAYSCALE || fb->width < 2 || fb->height < 2) {
+        return result;
+    }
+
+    float offsets[VISION_SAMPLE_ROWS] = {};
+    uint16_t widths[VISION_SAMPLE_ROWS] = {};
+    int count = 0;
+
+    const uint32_t width = fb->width;
+    const uint32_t height = fb->height;
+    const uint32_t yStart = height / 2;
+    const uint32_t yEnd = height - 1;
+
+    for (uint8_t i = 0; i < VISION_SAMPLE_ROWS; i++) {
+        uint32_t y = yEnd - ((yEnd - yStart) * i) / (VISION_SAMPLE_ROWS - 1);
+        const uint8_t *row = fb->buf + y * width;
+        float center = 0.0f;
+        int centerX = 0;
+        uint16_t segmentPixels = 0;
+
+        if (findLineCenterInRow(row, width, center, centerX, segmentPixels)) {
+            uint8_t offsetIndex = VISION_SAMPLE_ROWS - 1 - i;
+            offsets[offsetIndex] = center;
+            widths[offsetIndex] = segmentPixels;
+            count++;
+        }
+    }
+
+    result.validRows = count;
+
+    if (count > 0) {
+        int compactIndex = 0;
+
+        for (uint8_t i = 0; i < VISION_SAMPLE_ROWS; i++) {
+            if (widths[i] > 0) {
+                offsets[compactIndex] = offsets[i];
+                widths[compactIndex] = widths[i];
+                compactIndex++;
+            }
+        }
+
+        count = compactIndex;
+        result.validRows = count;
+    }
+
+    if (count > 0) {
+        float sum = 0.0f;
+        float widthSum = 0.0f;
+
+        result.topOffset = offsets[0];
+        result.bottomOffset = offsets[count - 1];
+
+        for (int i = 0; i < count; i++) {
+            sum += offsets[i];
+            widthSum += widths[i];
+        }
+
+        result.centerOffset = sum / static_cast<float>(count);
+
+        float residualSum = 0.0f;
+        result.maxJump = 0.0f;
+
+        for (int i = 0; i < count; i++) {
+            residualSum += absf(offsets[i] - result.centerOffset);
+
+            if (i > 0) {
+                float jump = absf(offsets[i] - offsets[i - 1]);
+
+                if (jump > result.maxJump) {
+                    result.maxJump = jump;
+                }
+            }
+        }
+
+        result.meanResidual = residualSum / static_cast<float>(count);
+
+        float averageWidth = widthSum / static_cast<float>(count);
+        float expectedWidth = static_cast<float>(width) * VISION_EXPECTED_LINE_WIDTH_RATIO;
+        float widthQuality = constrain(averageWidth / expectedWidth, 0.0f, 1.0f);
+        float rowQuality = static_cast<float>(count) / static_cast<float>(VISION_SAMPLE_ROWS);
+        float stabilityQuality = 1.0f - constrain(
+            result.meanResidual / VISION_CENTER_STABILITY_FULL_SCALE,
+            0.0f,
+            1.0f
+        );
+
+        result.confidence = constrain(
+            rowQuality * 0.45f + widthQuality * 0.35f + stabilityQuality * 0.20f,
+            0.0f,
+            1.0f
+        );
+        float endDiff = absf(result.bottomOffset - result.topOffset);
+        bool straightLine =
+            count >= VISION_STRAIGHT_MIN_ROWS &&
+            result.confidence >= VISION_LINE_FOUND_MIN_QUALITY &&
+            endDiff <= VISION_STRAIGHT_MAX_END_DIFF &&
+            result.meanResidual <= VISION_STRAIGHT_MAX_RESIDUAL &&
+            result.maxJump <= VISION_STRAIGHT_MAX_ROW_JUMP;
+
+        if (straightLine) {
+            result.type = RoadType::Straight;
+        } else if (result.confidence >= VISION_LINE_FOUND_MIN_QUALITY) {
+            result.type = RoadType::NormalCurve;
+        } else {
+            result.type = RoadType::Unknown;
+        }
+    }
+
+    return result;
+}
+
+static void cacheGrayFrame(camera_fb_t *fb, uint32_t frameId)
+{
+    if (fb == nullptr ||
+        fb->format != PIXFORMAT_GRAYSCALE ||
+        fb->width > 160 ||
+        fb->height > 120) {
+        return;
+    }
+
+    const uint32_t bytes = fb->width * fb->height;
+    memcpy(latestGrayFrame, fb->buf, bytes);
+    latestGrayFrameWidth = fb->width;
+    latestGrayFrameHeight = fb->height;
+    latestGrayFrameId = frameId;
+}
+
+static void updateVision()
+{
+    if (!ENABLE_CAMERA || !cameraReady) {
+        return;
+    }
+
+    uint32_t now = millis();
+
+    if (now - lastVisionMs < VISION_PROCESS_INTERVAL_MS) {
+        return;
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+
+    if (fb == nullptr) {
+        lastVisionMs = now;
+        return;
+    }
+
+    uint32_t previousUpdateMs = vision.lastUpdateMs;
+
+    VisionResult rawVision = analyzeBinaryRoad(fb);
+    vision = rawVision;
+    visionCount++;
+    cacheGrayFrame(fb, vision.frameId);
+    lastVisionMs = millis();
+
+    if (previousUpdateMs != 0 && vision.lastUpdateMs > previousUpdateMs) {
+        uint32_t dt = vision.lastUpdateMs - previousUpdateMs;
+        float measuredFps = 1000.0f / static_cast<float>(dt);
+        visionFps = 0.7f * visionFps + 0.3f * measuredFps;
+    }
+
+    esp_camera_fb_return(fb);
+
+    if (ENABLE_V1_UART_LINK && now - lastVisionUartMs >= VISION_UART_SEND_INTERVAL_MS) {
+        lastVisionUartMs = now;
+        sendV1VisionTelemetry(vision);
+    }
 }
 
 // =========================
@@ -348,9 +750,9 @@ static bool initCamera()
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
 
-    config.xclk_freq_hz = 20000000;
+    config.xclk_freq_hz = CAMERA_XCLK_HZ;
     config.pixel_format = PIXFORMAT_GRAYSCALE;
-    config.frame_size = FRAMESIZE_QVGA;
+    config.frame_size = CAMERA_FRAME_SIZE;
     config.jpeg_quality = 12;
 
     config.fb_count = psramFound() ? 2 : 1;
@@ -369,7 +771,7 @@ static bool initCamera()
     sensor_t *sensor = esp_camera_sensor_get();
 
     if (sensor != nullptr) {
-        sensor->set_framesize(sensor, config.frame_size);
+        sensor->set_framesize(sensor, CAMERA_FRAME_SIZE);
     }
 
     Serial.println("Camera init OK");
@@ -401,12 +803,14 @@ static void handleRoot()
     <img id="frame" src="/binary" alt="binary camera frame">
     <p id="status" class="status">Loading frames...</p>
     <p id="imu" class="status">Loading IMU...</p>
-    <p><a href="/imu">/imu</a> | <a href="/binary">/binary</a></p>
+    <p id="vision" class="status">Loading vision...</p>
+    <p><a href="/imu">/imu</a> | <a href="/vision">/vision</a> | <a href="/binary">/binary</a></p>
   </main>
   <script>
     const frame = document.getElementById('frame');
     const statusEl = document.getElementById('status');
     const imuEl = document.getElementById('imu');
+    const visionEl = document.getElementById('vision');
     let count = 0;
     let cameraEnabled = false;
     let frameLoopStarted = false;
@@ -424,7 +828,7 @@ static void handleRoot()
           'MPU: ' + (j.mpuReady ? 'ok' : 'fail') +
           ' | gyroZ: ' + j.gyroZ.toFixed(2) + ' deg/s' +
           ' | camera: ' + (j.cameraReady ? 'ok' : 'off') +
-          ' | udp: ' + j.telemetryCount;
+          ' | uart: ' + j.telemetryCount;
 
         if (cameraEnabled && !frameLoopStarted) {
           frameLoopStarted = true;
@@ -443,11 +847,28 @@ static void handleRoot()
       setTimeout(updateImu, 200);
     }
 
+    async function updateVision() {
+      try {
+        const r = await fetch('/vision?t=' + Date.now());
+        const j = await r.json();
+        visionEl.textContent =
+          'Vision: ' + j.type +
+          ' | offset: ' + j.centerOffset.toFixed(2) +
+          ' | rows: ' + j.validRows +
+          ' | lineQ: ' + j.confidence.toFixed(2) +
+          ' | fps: ' + j.fps.toFixed(1);
+      } catch (e) {
+        visionEl.textContent = 'Vision read failed';
+      }
+
+      setTimeout(updateVision, 200);
+    }
+
     frame.onload = () => {
       count++;
       statusEl.textContent = 'Frames loaded: ' + count;
       if (cameraEnabled) {
-        setTimeout(nextFrame, 120);
+        setTimeout(nextFrame, 250);
       }
     };
 
@@ -468,6 +889,7 @@ static void handleRoot()
     }
 
     updateImu();
+    updateVision();
   </script>
 </body>
 </html>
@@ -496,32 +918,36 @@ static void handleImu()
     server.send(200, "application/json", json);
 }
 
-static void handleCapture()
+static void handleVision()
 {
-    if (!ENABLE_CAMERA || !cameraReady) {
-        server.send(503, "text/plain", "Camera is not ready");
-        return;
-    }
+    uint32_t ageMs = vision.lastUpdateMs == 0 ? 0 : millis() - vision.lastUpdateMs;
+    char json[384];
 
-    camera_fb_t *fb = esp_camera_fb_get();
+    snprintf(
+        json,
+        sizeof(json),
+        "{\"type\":\"%s\",\"typeId\":%u,\"validRows\":%d,\"centerOffset\":%.3f,\"topOffset\":%.3f,\"bottomOffset\":%.3f,\"meanResidual\":%.3f,\"maxJump\":%.3f,\"confidence\":%.3f,\"frameId\":%lu,\"ageMs\":%lu,\"fps\":%.2f}",
+        roadTypeName(vision.type),
+        static_cast<unsigned>(vision.type),
+        vision.validRows,
+        vision.centerOffset,
+        vision.topOffset,
+        vision.bottomOffset,
+        vision.meanResidual,
+        vision.maxJump,
+        vision.confidence,
+        static_cast<unsigned long>(vision.frameId),
+        static_cast<unsigned long>(ageMs),
+        visionFps
+    );
 
-    if (fb == nullptr) {
-        server.send(503, "text/plain", "Camera capture failed");
-        return;
-    }
+    server.send(200, "application/json", json);
+}
 
-    if (fb->format != PIXFORMAT_GRAYSCALE) {
-        esp_camera_fb_return(fb);
-        server.send(500, "text/plain", "Camera is not in grayscale mode");
-        return;
-    }
-
-    captureCount++;
-
+static void sendBinaryBmpFromGray(const uint8_t *grayBuf, uint32_t width, uint32_t height)
+{
     WiFiClient client = server.client();
 
-    const uint32_t width = fb->width;
-    const uint32_t height = fb->height;
     const uint32_t rowSize = ((width * 3) + 3) & ~3U;
     const uint32_t pixelBytes = rowSize * height;
     const uint32_t fileSize = 54 + pixelBytes;
@@ -573,7 +999,7 @@ static void handleCapture()
     uint8_t row[960] = {};
 
     for (int32_t y = static_cast<int32_t>(height) - 1; y >= 0; --y) {
-        const uint8_t *src = fb->buf + static_cast<uint32_t>(y) * width;
+        const uint8_t *src = grayBuf + static_cast<uint32_t>(y) * width;
 
         for (uint32_t x = 0; x < width; ++x) {
             uint8_t value = src[x] >= BINARY_THRESHOLD ? 255 : 0;
@@ -590,6 +1016,31 @@ static void handleCapture()
 
         client.write(row, rowSize);
     }
+}
+
+static void handleCapture()
+{
+    if (!ENABLE_CAMERA || !cameraReady) {
+        server.send(503, "text/plain", "Camera is not ready");
+        return;
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+
+    if (fb == nullptr) {
+        server.send(503, "text/plain", "Camera capture failed");
+        return;
+    }
+
+    if (fb->format != PIXFORMAT_GRAYSCALE) {
+        esp_camera_fb_return(fb);
+        server.send(500, "text/plain", "Camera is not in grayscale mode");
+        return;
+    }
+
+    captureCount++;
+    cacheGrayFrame(fb, latestGrayFrameId + 1);
+    sendBinaryBmpFromGray(fb->buf, fb->width, fb->height);
 
     esp_camera_fb_return(fb);
 }
@@ -600,6 +1051,7 @@ static void startCameraServer()
     server.on("/capture", HTTP_GET, handleCapture);
     server.on("/binary", HTTP_GET, handleCapture);
     server.on("/imu", HTTP_GET, handleImu);
+    server.on("/vision", HTTP_GET, handleVision);
 
     server.on("/stream", HTTP_GET, []() {
         server.send(200, "text/plain", "MJPEG stream disabled. Use /binary.");
@@ -616,7 +1068,7 @@ void setup()
     delay(2000);
 
     Serial.println();
-    Serial.println("ESP32-S3 CAM + MPU6050 + UDP telemetry");
+    Serial.println("ESP32-S3 CAM + MPU6050 + UART telemetry");
 
     cameraReady = initCamera();
 
@@ -628,15 +1080,7 @@ void setup()
 
     mpuReady = initMPU();
 
-    if (ENABLE_V1_UART_LINK) {
-        v1Uart.begin(V1_UART_BAUD, SERIAL_8N1, V1_UART_RX_PIN, V1_UART_TX_PIN);
-        Serial.printf(
-            "V1 UART telemetry: TX=GPIO%d RX=GPIO%d baud=%lu\r\n",
-            V1_UART_TX_PIN,
-            V1_UART_RX_PIN,
-            static_cast<unsigned long>(V1_UART_BAUD)
-        );
-    }
+    beginV1UartLink();
 
     if (!mpuReady) {
         Serial.println("MPU failed. Camera still runs.");
@@ -645,12 +1089,9 @@ void setup()
     WiFi.mode(WIFI_AP);
     WiFi.softAP(AP_SSID, AP_PASSWORD);
 
-    telemetryUdp.begin(CAMERA_LINK_PORT);
-
     Serial.printf("WiFi AP: %s\r\n", AP_SSID);
     Serial.printf("Password: %s\r\n", AP_PASSWORD);
     Serial.printf("Open: http://%s/\r\n", WiFi.softAPIP().toString().c_str());
-    Serial.printf("UDP broadcast: 192.168.4.255:%u\r\n", CAMERA_LINK_PORT);
     Serial.printf("Camera enabled: %s\r\n", ENABLE_CAMERA ? "yes" : "no");
 
     startCameraServer();
@@ -659,6 +1100,7 @@ void setup()
 void loop()
 {
     updateMPU();
+    updateVision();
     sendTelemetryPacket();
 
     server.handleClient();
@@ -670,13 +1112,17 @@ void loop()
         lastStatusMs = now;
 
         Serial.printf(
-            "alive camera=%s mpu=%s gyroZ=%.2f ip=%s clients=%u captures=%lu udp=%lu\r\n",
+            "alive camera=%s mpu=%s gyroZ=%.2f line=%s offset=%.2f lineQ=%.2f ip=%s clients=%u captures=%lu vision=%lu uart=%lu\r\n",
             cameraReady ? "ok" : "fail",
             mpuReady ? "ok" : "fail",
             filteredGyroZDps,
+            roadTypeName(vision.type),
+            vision.centerOffset,
+            vision.confidence,
             WiFi.softAPIP().toString().c_str(),
             WiFi.softAPgetStationNum(),
             static_cast<unsigned long>(captureCount),
+            static_cast<unsigned long>(visionCount),
             static_cast<unsigned long>(telemetryCount)
         );
     }
