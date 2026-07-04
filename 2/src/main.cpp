@@ -50,6 +50,12 @@ constexpr float VISION_STRAIGHT_MAX_END_DIFF = 0.16f;
 constexpr float VISION_STRAIGHT_MAX_RESIDUAL = 0.055f;
 constexpr float VISION_STRAIGHT_MAX_ROW_JUMP = 0.14f;
 constexpr float VISION_LINE_FOUND_MIN_QUALITY = 0.35f;
+constexpr float VISION_RIGHT_ANGLE_NEAR_OFFSET = 0.38f;
+constexpr float VISION_RIGHT_ANGLE_END_DIFF = 0.42f;
+constexpr float VISION_RIGHT_ANGLE_MAX_JUMP = 0.32f;
+constexpr float VISION_S_CURVE_END_DIFF = 0.34f;
+constexpr float VISION_S_CURVE_MID_SMALL = 0.18f;
+constexpr float VISION_S_CURVE_SLOPE_MIN = 0.12f;
 
 // =========================
 // UART 发给 V1 主控板
@@ -370,12 +376,13 @@ static void sendV1VisionTelemetry(const VisionResult &result)
     snprintf(
         body,
         sizeof(body),
-        "CAM,%lu,%.3f,%.3f,%.3f,%.2f",
+        "CAM,%lu,%.3f,%.3f,%.3f,%.2f,%u",
         static_cast<unsigned long>(uartTelemetrySeq),
         result.bottomOffset,
         result.topOffset,
         result.centerOffset,
-        result.confidence
+        result.confidence,
+        static_cast<unsigned>(result.type)
     );
 
     sendV1Packet(body);
@@ -536,6 +543,59 @@ static bool findLineCenterInRow(
     return true;
 }
 
+static RoadType classifyRoadShape(
+    const float *offsets,
+    int count,
+    const VisionResult &result
+)
+{
+    if (count < 5 || result.confidence < VISION_LINE_FOUND_MIN_QUALITY) {
+        return RoadType::Unknown;
+    }
+
+    float farOffset = result.topOffset;
+    float nearOffset = result.bottomOffset;
+    float midOffset = offsets[count / 2];
+    float endDiff = absf(nearOffset - farOffset);
+    float farSlope = midOffset - farOffset;
+    float nearSlope = nearOffset - midOffset;
+
+    bool straightLine =
+        count >= VISION_STRAIGHT_MIN_ROWS &&
+        endDiff <= VISION_STRAIGHT_MAX_END_DIFF &&
+        result.meanResidual <= VISION_STRAIGHT_MAX_RESIDUAL &&
+        result.maxJump <= VISION_STRAIGHT_MAX_ROW_JUMP;
+
+    if (straightLine) {
+        return RoadType::Straight;
+    }
+
+    bool rightAngle =
+        absf(nearOffset) >= VISION_RIGHT_ANGLE_NEAR_OFFSET &&
+        (endDiff >= VISION_RIGHT_ANGLE_END_DIFF ||
+         result.maxJump >= VISION_RIGHT_ANGLE_MAX_JUMP);
+
+    if (rightAngle) {
+        return RoadType::RightAngle;
+    }
+
+    bool oppositeEnds =
+        (farOffset > VISION_S_CURVE_SLOPE_MIN && nearOffset < -VISION_S_CURVE_SLOPE_MIN) ||
+        (farOffset < -VISION_S_CURVE_SLOPE_MIN && nearOffset > VISION_S_CURVE_SLOPE_MIN);
+    bool oppositeSlopes =
+        (farSlope > VISION_S_CURVE_SLOPE_MIN && nearSlope < -VISION_S_CURVE_SLOPE_MIN) ||
+        (farSlope < -VISION_S_CURVE_SLOPE_MIN && nearSlope > VISION_S_CURVE_SLOPE_MIN);
+    bool middleReturns =
+        absf(midOffset) <= VISION_S_CURVE_MID_SMALL &&
+        endDiff >= VISION_S_CURVE_END_DIFF;
+
+    if ((oppositeEnds && middleReturns) || oppositeSlopes) {
+        return RoadType::SCurve;
+    }
+
+    return RoadType::NormalCurve;
+}
+
 static VisionResult analyzeBinaryRoad(camera_fb_t *fb)
 {
     VisionResult result;
@@ -633,21 +693,7 @@ static VisionResult analyzeBinaryRoad(camera_fb_t *fb)
             0.0f,
             1.0f
         );
-        float endDiff = absf(result.bottomOffset - result.topOffset);
-        bool straightLine =
-            count >= VISION_STRAIGHT_MIN_ROWS &&
-            result.confidence >= VISION_LINE_FOUND_MIN_QUALITY &&
-            endDiff <= VISION_STRAIGHT_MAX_END_DIFF &&
-            result.meanResidual <= VISION_STRAIGHT_MAX_RESIDUAL &&
-            result.maxJump <= VISION_STRAIGHT_MAX_ROW_JUMP;
-
-        if (straightLine) {
-            result.type = RoadType::Straight;
-        } else if (result.confidence >= VISION_LINE_FOUND_MIN_QUALITY) {
-            result.type = RoadType::NormalCurve;
-        } else {
-            result.type = RoadType::Unknown;
-        }
+        result.type = classifyRoadShape(offsets, count, result);
     }
 
     return result;

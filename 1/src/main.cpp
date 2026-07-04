@@ -205,6 +205,7 @@ struct MpuTelemetry {
     uint32_t byteCount = 0;
     int imuSeq = 0;
     int camSeq = 0;
+    int roadType = 0;
 };
 
 struct CameraFeedForwardSample {
@@ -215,6 +216,7 @@ struct CameraFeedForwardSample {
     float nearOffset = 0.0f;
     float farOffset = 0.0f;
     float lineQuality = 0.0f;
+    int roadType = 0;
 };
 
 constexpr size_t CAMERA_FF_BUFFER_SIZE = 24;
@@ -240,6 +242,7 @@ static void pushCameraFeedForwardSample(
     float farOffset,
     float centerOffset,
     float lineQuality,
+    int roadType,
     uint32_t timeMs
 )
 {
@@ -252,6 +255,7 @@ static void pushCameraFeedForwardSample(
     sample.nearOffset = constrain(nearOffset, -1.0f, 1.0f);
     sample.farOffset = constrain(farOffset, -1.0f, 1.0f);
     sample.lineQuality = constrain(lineQuality, 0.0f, 1.0f);
+    sample.roadType = roadType;
 
     cameraFeedForwardWriteIndex = (cameraFeedForwardWriteIndex + 1) % CAMERA_FF_BUFFER_SIZE;
 }
@@ -288,17 +292,35 @@ static bool getDelayedCameraFeedForwardSample(uint32_t now, CameraFeedForwardSam
     return found;
 }
 
-static bool cameraSampleLooksCurved(const CameraFeedForwardSample &sample)
+static float cameraCurveMetric(const CameraFeedForwardSample &sample)
 {
     float endDiff = fabsf(sample.nearOffset - sample.farOffset);
     float centerAbs = fabsf(sample.centerOffset);
     float nearAbs = fabsf(sample.nearOffset);
     float farAbs = fabsf(sample.farOffset);
+    float metric = endDiff;
 
-    return endDiff >= CAMERA_CURVE_OFFSET_THRESHOLD ||
-        centerAbs >= CAMERA_CURVE_OFFSET_THRESHOLD ||
-        nearAbs >= CAMERA_CURVE_OFFSET_THRESHOLD ||
-        farAbs >= CAMERA_CURVE_OFFSET_THRESHOLD;
+    metric = max(metric, centerAbs);
+    metric = max(metric, nearAbs);
+    metric = max(metric, farAbs);
+
+    return metric;
+}
+
+static const char *cameraRoadTypeName(int roadType)
+{
+    switch (roadType) {
+    case 1:
+        return "straight";
+    case 2:
+        return "s_curve";
+    case 3:
+        return "right_angle";
+    case 4:
+        return "normal_curve";
+    default:
+        return "unknown";
+    }
 }
 
 static uint8_t telemetryChecksum(const char *text)
@@ -385,13 +407,26 @@ static bool parseS3CamTelemetryBody(const char *body)
     float farOffset = 0.0f;
     float curve = 0.0f;
     float quality = 0.0f;
+    int roadType = 0;
 
-    if (sscanf(body, "CAM,%d,%f,%f,%f,%f", &camSeq, &nearOffset, &farOffset, &curve, &quality) == 5) {
+    int camFields = sscanf(
+        body,
+        "CAM,%d,%f,%f,%f,%f,%d",
+        &camSeq,
+        &nearOffset,
+        &farOffset,
+        &curve,
+        &quality,
+        &roadType
+    );
+
+    if (camFields == 5 || camFields == 6) {
         if (mpuTelemetry.camSeq > 0 && camSeq > mpuTelemetry.camSeq + 1) {
             mpuTelemetry.lostCount += camSeq - mpuTelemetry.camSeq - 1;
         }
 
         mpuTelemetry.camSeq = camSeq;
+        mpuTelemetry.roadType = camFields == 6 ? roadType : 0;
         mpuTelemetry.valid = quality > 0.0f;
         mpuTelemetry.gyroZDps = 0.0f;
         mpuTelemetry.confidence = constrain(quality, 0.0f, 1.0f);
@@ -406,6 +441,7 @@ static bool parseS3CamTelemetryBody(const char *body)
             mpuTelemetry.farOffset,
             mpuTelemetry.prediction,
             mpuTelemetry.confidence,
+            mpuTelemetry.roadType,
             mpuTelemetry.lastCamUpdateMs
         );
         mpuTelemetry.packetCount++;
@@ -634,11 +670,32 @@ void loop() {
     float gyroCorrection = 0.0f;
     CameraFeedForwardSample delayedCameraSample;
     bool cameraSpeedActive = getDelayedCameraFeedForwardSample(now, delayedCameraSample);
-    bool cameraCurveAhead = cameraSpeedActive && cameraSampleLooksCurved(delayedCameraSample);
-    int dynamicBaseSpeed = BASE_SPEED;
+    float cameraCurveValue = cameraSpeedActive ? cameraCurveMetric(delayedCameraSample) : 0.0f;
+    bool cameraRightAngleAhead = cameraSpeedActive && delayedCameraSample.roadType == 3;
+    bool cameraSCurveAhead = cameraSpeedActive && delayedCameraSample.roadType == 2;
+    bool cameraNormalCurveAhead = cameraSpeedActive && delayedCameraSample.roadType == 4;
+    bool cameraStraightAhead = cameraSpeedActive && delayedCameraSample.roadType == 1;
+    bool cameraCurveAhead = cameraSpeedActive &&
+        (cameraSCurveAhead ||
+         cameraNormalCurveAhead ||
+         cameraRightAngleAhead ||
+         (delayedCameraSample.roadType == 0 && cameraCurveValue >= CAMERA_CURVE_THRESHOLD));
+    bool cameraHardCurveAhead = cameraSpeedActive &&
+        (cameraRightAngleAhead ||
+         (delayedCameraSample.roadType == 0 && cameraCurveValue >= CAMERA_HARD_CURVE_THRESHOLD));
+    bool grayCurveNow = lineSeen && abs(turnWeight) >= GRAY_CURVE_SPEED_TURN_WEIGHT;
+    int dynamicBaseSpeed = grayCurveNow ? CAMERA_CURVE_SPEED : BASE_SPEED;
 
     if (cameraSpeedActive) {
-        dynamicBaseSpeed = cameraCurveAhead ? CAMERA_CURVE_SPEED : CAMERA_STRAIGHT_SPEED;
+        if (cameraHardCurveAhead) {
+            dynamicBaseSpeed = CAMERA_HARD_CURVE_SPEED;
+        } else if (cameraSCurveAhead) {
+            dynamicBaseSpeed = CAMERA_S_CURVE_SPEED;
+        } else if (cameraStraightAhead) {
+            dynamicBaseSpeed = CAMERA_STRAIGHT_SPEED;
+        } else {
+            dynamicBaseSpeed = cameraCurveAhead ? CAMERA_CURVE_SPEED : CAMERA_STRAIGHT_SPEED;
+        }
     }
 
     if (realLost) {
@@ -649,19 +706,19 @@ void loop() {
             finalTurnWeight = -LOST_TURN_WEIGHT;
         }
         controlTurnWeight = static_cast<float>(finalTurnWeight);
-        dynamicBaseSpeed = CAMERA_CURVE_SPEED;
+        dynamicBaseSpeed = CAMERA_HARD_CURVE_SPEED;
 
     } else if (hardLeft) {
         // 左直角弯：直接给一个固定的强转向权重
         finalTurnWeight = -HARD_TURN_WEIGHT;
         controlTurnWeight = static_cast<float>(finalTurnWeight);
-        dynamicBaseSpeed = CAMERA_CURVE_SPEED;
+        dynamicBaseSpeed = CAMERA_HARD_CURVE_SPEED;
 
     } else if (hardRight) {
         // 右直角弯：直接给一个固定的强转向权重
         finalTurnWeight = HARD_TURN_WEIGHT;
         controlTurnWeight = static_cast<float>(finalTurnWeight);
-        dynamicBaseSpeed = CAMERA_CURVE_SPEED;
+        dynamicBaseSpeed = CAMERA_HARD_CURVE_SPEED;
 
     } else {
         // 普通循迹：直接使用灰度传感器算出来的转向权重
@@ -748,7 +805,7 @@ void loop() {
         }
 
         Serial.printf(
-            "LINE %s gray=%d turn=%s hardL=%d hardR=%d lost=%d | MOTOR L=%d R=%d base=%d ctrl=%.2f grayD=%.2f camCurve=%d\r\n",
+            "LINE %s gray=%d turn=%s hardL=%d hardR=%d lost=%d | MOTOR L=%d R=%d base=%d ctrl=%.2f grayD=%.2f camType=%s camCurve=%d hardCam=%d grayCurve=%d curveM=%.2f\r\n",
             lineState,
             turnWeight,
             turnHint,
@@ -760,14 +817,19 @@ void loop() {
             dynamicBaseSpeed,
             controlTurnWeight,
             grayDCorrection,
-            cameraCurveAhead ? 1 : 0
+            cameraRoadTypeName(cameraSpeedActive ? delayedCameraSample.roadType : 0),
+            cameraCurveAhead ? 1 : 0,
+            cameraHardCurveAhead ? 1 : 0,
+            grayCurveNow ? 1 : 0,
+            cameraCurveValue
         );
         Serial.printf(
-            "CAM %s age=%lums speedAge=%lums speedSeq=%d near=%.2f far=%.2f center=%.2f lineQ=%.2f\r\n",
+            "CAM %s age=%lums speedAge=%lums speedSeq=%d type=%s near=%.2f far=%.2f center=%.2f lineQ=%.2f\r\n",
             camFresh ? "OK" : "WAIT",
             static_cast<unsigned long>(camAge),
             static_cast<unsigned long>(cameraSpeedAge),
             cameraSpeedActive ? delayedCameraSample.seq : 0,
+            cameraRoadTypeName(mpuTelemetry.roadType),
             mpuTelemetry.nearOffset,
             mpuTelemetry.farOffset,
             mpuTelemetry.prediction,
@@ -798,12 +860,14 @@ void loop() {
     if (ENABLE_SERIAL_TRACE && now - lastTraceMs >= SERIAL_TRACE_INTERVAL_MS) {
         lastTraceMs = now;
         Serial.printf(
-            "VISION_RAW center=%.3f near=%.3f far=%.3f lineQ=%.2f camCurve=%d speedAge=%lu base=%d camAge=%lu imuGyro=%.2f imuAge=%lu\r\n",
+            "VISION_RAW type=%s center=%.3f near=%.3f far=%.3f lineQ=%.2f camCurve=%d curveM=%.3f speedAge=%lu base=%d camAge=%lu imuGyro=%.2f imuAge=%lu\r\n",
+            cameraRoadTypeName(mpuTelemetry.roadType),
             mpuTelemetry.prediction,
             mpuTelemetry.nearOffset,
             mpuTelemetry.farOffset,
             mpuTelemetry.confidence,
             cameraCurveAhead ? 1 : 0,
+            cameraCurveValue,
             static_cast<unsigned long>(cameraSpeedAge),
             dynamicBaseSpeed,
             static_cast<unsigned long>(camAge),
