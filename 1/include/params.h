@@ -33,19 +33,19 @@ constexpr bool ENABLE_STRAIGHT_CENTER_LOCK = true;
 constexpr int STRAIGHT_LOCK_CONFIRM_COUNT = 3;
 
 // 是否启用 V1 本地灰度 PD 的 D 项。
-// 使用拟合后的连续目标线误差，D 项可以重新启用。
+// 默认关闭，保持当前稳定巡线行为；要抑制小幅摆头时再打开。
 constexpr bool ENABLE_GRAY_D_CORRECTION = true;
 
 // 灰度误差变化量对转向的阻尼强度。
 // 太抖就加大一点；入弯变钝或转不过就减小。
-constexpr float GRAY_D_GAIN = 10.0f;
+constexpr float GRAY_D_GAIN = 4.0f;
 
 // 灰度 D 单次最大修正，防止权重跳变时一把修过头。
-constexpr float GRAY_D_CORRECTION_CLAMP = 12.0f;
+constexpr float GRAY_D_CORRECTION_CLAMP = 6.0f;
 
 // 直角弯时使用的强制转向权重。
 // 转出去或甩头就降低；直角转不过再升。
-constexpr int HARD_TURN_WEIGHT = 62;
+constexpr int HARD_TURN_WEIGHT = 55;
 
 // 丢线找线时使用的转向权重。
 // 丢线后找不回来就升到 5；乱甩就降到 3
