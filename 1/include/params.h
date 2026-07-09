@@ -17,10 +17,10 @@ constexpr int LEFT_SPEED_TRIM = -2;
 
 // 基础前进速度。
 // 太容易冲出去就调小，跑得太慢就调大。
-constexpr int BASE_SPEED = 76;
+constexpr int BASE_SPEED = 72;
 
 // 最大速度限制，防止输出过大。
-constexpr int MAX_SPEED = 95;
+constexpr int MAX_SPEED = 90;
 
 // 普通循迹转向力度。
 // 这里相当于差速转向的 P：弯转不过就加大，左右抖就减小。
@@ -33,14 +33,14 @@ constexpr bool ENABLE_GRAY_D_CORRECTION = true;
 
 // 灰度误差变化量对转向的阻尼强度。
 // 太抖就加大一点；入弯变钝或转不过就减小。
-constexpr float GRAY_D_GAIN = 25.0f;
+constexpr float GRAY_D_GAIN = 27.0f;
 
 // 灰度 D 单次最大修正，防止权重跳变时一把修过头。
-constexpr float GRAY_D_CORRECTION_CLAMP = 30.0f;
+constexpr float GRAY_D_CORRECTION_CLAMP = 35.0f;
 
 // 直角弯时使用的强制转向权重。
 // 转出去或甩头就降低；直角转不过再升。
-constexpr int HARD_TURN_WEIGHT = 90;
+constexpr int HARD_TURN_WEIGHT = 70;
 
 // 丢线找线时使用的转向权重。
 // 丢线后找不回来就升到 5；乱甩就降到 3
@@ -48,7 +48,7 @@ constexpr int LOST_TURN_WEIGHT = 5;
 
 // 连续检测到几次外侧压线，才认为是直角弯
 // 抖动和误识别时用 2 或 3；响应太慢再降到 1。
-constexpr int HARD_CONFIRM_COUNT = 2;
+constexpr int HARD_CONFIRM_COUNT = 1;
 
 // 连续丢线几次，才进入丢线找线
 // 误触发 LOST 就升到 4；丢线救不回来就降到 2
