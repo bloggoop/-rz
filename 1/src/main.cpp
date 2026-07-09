@@ -1,10 +1,8 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include <math.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include "params.h"
-
 class Motor {
 public:
     Motor(int in1, int in2, int ch1, int ch2, bool reverse = false)
@@ -19,7 +17,7 @@ public:
     }
 
     void setSpeed(int speed) {
-        speed = constrain(speed, -100, 100);
+        speed = constrain(speed, -180, 180);
 
         if (reversed) {
             speed = -speed;
@@ -198,28 +196,12 @@ struct MpuTelemetry {
     float farOffset = 0.0f;
     int lostCount = 0;
     uint32_t lastUpdateMs = 0;
-    uint32_t lastImuUpdateMs = 0;
-    uint32_t lastCamUpdateMs = 0;
     uint32_t packetCount = 0;
     uint32_t parseFailCount = 0;
     uint32_t byteCount = 0;
     int imuSeq = 0;
     int camSeq = 0;
-    int roadType = 0;
 };
-
-struct CameraFeedForwardSample {
-    bool valid = false;
-    uint32_t timeMs = 0;
-    int seq = 0;
-    float centerOffset = 0.0f;
-    float nearOffset = 0.0f;
-    float farOffset = 0.0f;
-    float lineQuality = 0.0f;
-    int roadType = 0;
-};
-
-constexpr size_t CAMERA_FF_BUFFER_SIZE = 24;
 
 Motor leftMotor(LEFT_MOTOR_PINS[0], LEFT_MOTOR_PINS[1], 0, 1, true);
 Motor rightMotor(RIGHT_MOTOR_PINS[0], RIGHT_MOTOR_PINS[1], 2, 3, false);
@@ -230,97 +212,57 @@ Encoder rightEncoder(RIGHT_ENCODER_PINS[0], RIGHT_ENCODER_PINS[1]);
 BreathingLed led(LED_PIN, 4);
 GraySensorArray gray;
 MpuTelemetry mpuTelemetry;
-CameraFeedForwardSample cameraFeedForwardBuffer[CAMERA_FF_BUFFER_SIZE];
-size_t cameraFeedForwardWriteIndex = 0;
-HardwareSerial telemetrySerial(2);
+HardwareSerial telemetrySerial(1);
 char telemetryLine[128];
 size_t telemetryLineLen = 0;
+uint32_t lastTelemetryByteMs = 0;
+int activeTelemetryRxPin = TELEMETRY_UART_RX_PIN;
+uint32_t lastTelemetryProbeMs = 0;
+volatile bool hasI2CTelemetryLine = false;
+char i2cTelemetryLine[128];
+bool i2cPinSwap = false;
+uint32_t lastI2CReprobeMs = 0;
+uint8_t telemetryRawSample[48];
+size_t telemetryRawSampleLen = 0;
+int lastPulseLevel = HIGH;
+uint32_t pulseLowStartMs = 0;
+uint32_t lastPulseEdgeMs = 0;
+int pulseState = 0;
+int pulseSign = 1;
+int pulseCount = 0;
 
-static void pushCameraFeedForwardSample(
-    int seq,
-    float nearOffset,
-    float farOffset,
-    float centerOffset,
-    float lineQuality,
-    int roadType,
-    uint32_t timeMs
-)
+static void resetTelemetryRawSample()
 {
-    CameraFeedForwardSample &sample = cameraFeedForwardBuffer[cameraFeedForwardWriteIndex];
-
-    sample.valid = true;
-    sample.timeMs = timeMs;
-    sample.seq = seq;
-    sample.centerOffset = constrain(centerOffset, -1.0f, 1.0f);
-    sample.nearOffset = constrain(nearOffset, -1.0f, 1.0f);
-    sample.farOffset = constrain(farOffset, -1.0f, 1.0f);
-    sample.lineQuality = constrain(lineQuality, 0.0f, 1.0f);
-    sample.roadType = roadType;
-
-    cameraFeedForwardWriteIndex = (cameraFeedForwardWriteIndex + 1) % CAMERA_FF_BUFFER_SIZE;
+    telemetryRawSampleLen = 0;
 }
 
-static bool getDelayedCameraFeedForwardSample(uint32_t now, CameraFeedForwardSample &sample)
+static void recordTelemetryRawByte(uint8_t value)
 {
-    if (!ENABLE_CAMERA_SPEED_FEED_FORWARD) {
-        return false;
+    if (telemetryRawSampleLen < sizeof(telemetryRawSample)) {
+        telemetryRawSample[telemetryRawSampleLen++] = value;
     }
-
-    bool found = false;
-    uint32_t bestTime = 0;
-
-    for (size_t i = 0; i < CAMERA_FF_BUFFER_SIZE; i++) {
-        const CameraFeedForwardSample &candidate = cameraFeedForwardBuffer[i];
-
-        if (!candidate.valid || candidate.lineQuality < CAMERA_SPEED_MIN_LINE_QUALITY) {
-            continue;
-        }
-
-        uint32_t ageMs = now - candidate.timeMs;
-
-        if (ageMs < CAMERA_SPEED_DELAY_MS || ageMs > TELEMETRY_TIMEOUT_MS) {
-            continue;
-        }
-
-        if (!found || candidate.timeMs > bestTime) {
-            sample = candidate;
-            bestTime = candidate.timeMs;
-            found = true;
-        }
-    }
-
-    return found;
 }
 
-static float cameraCurveMetric(const CameraFeedForwardSample &sample)
+static void printTelemetryRawSample(const char *prefix)
 {
-    float endDiff = fabsf(sample.nearOffset - sample.farOffset);
-    float centerAbs = fabsf(sample.centerOffset);
-    float nearAbs = fabsf(sample.nearOffset);
-    float farAbs = fabsf(sample.farOffset);
-    float metric = endDiff;
-
-    metric = max(metric, centerAbs);
-    metric = max(metric, nearAbs);
-    metric = max(metric, farAbs);
-
-    return metric;
-}
-
-static const char *cameraRoadTypeName(int roadType)
-{
-    switch (roadType) {
-    case 1:
-        return "straight";
-    case 2:
-        return "s_curve";
-    case 3:
-        return "right_angle";
-    case 4:
-        return "normal_curve";
-    default:
-        return "unknown";
+    if (telemetryRawSampleLen == 0) {
+        return;
     }
+
+    Serial.printf("%s RX=%d raw:", prefix, activeTelemetryRxPin);
+
+    for (size_t i = 0; i < telemetryRawSampleLen; i++) {
+        Serial.printf(" %02X", telemetryRawSample[i]);
+    }
+
+    Serial.print(" ascii='");
+
+    for (size_t i = 0; i < telemetryRawSampleLen; i++) {
+        char c = static_cast<char>(telemetryRawSample[i]);
+        Serial.print((c >= 32 && c <= 126) ? c : '.');
+    }
+
+    Serial.println("'");
 }
 
 static uint8_t telemetryChecksum(const char *text)
@@ -371,6 +313,15 @@ static bool splitTelemetryPacket(const char *packet, char *body, size_t bodySize
 
     if (static_cast<uint8_t>(received) != expected) {
         mpuTelemetry.parseFailCount++;
+
+        static uint32_t lastCrcPrintMs = 0;
+        uint32_t now = millis();
+
+        if (now - lastCrcPrintMs >= 1000) {
+            lastCrcPrintMs = now;
+            Serial.printf("Telemetry CRC fail: '%s' expected=%02X\r\n", packet, expected);
+        }
+
         return false;
     }
 
@@ -397,7 +348,6 @@ static bool parseS3CamTelemetryBody(const char *body)
         mpuTelemetry.nearOffset = 0.0f;
         mpuTelemetry.farOffset = 0.0f;
         mpuTelemetry.lastUpdateMs = millis();
-        mpuTelemetry.lastImuUpdateMs = mpuTelemetry.lastUpdateMs;
         mpuTelemetry.packetCount++;
         return true;
     }
@@ -407,26 +357,13 @@ static bool parseS3CamTelemetryBody(const char *body)
     float farOffset = 0.0f;
     float curve = 0.0f;
     float quality = 0.0f;
-    int roadType = 0;
 
-    int camFields = sscanf(
-        body,
-        "CAM,%d,%f,%f,%f,%f,%d",
-        &camSeq,
-        &nearOffset,
-        &farOffset,
-        &curve,
-        &quality,
-        &roadType
-    );
-
-    if (camFields == 5 || camFields == 6) {
+    if (sscanf(body, "CAM,%d,%f,%f,%f,%f", &camSeq, &nearOffset, &farOffset, &curve, &quality) == 5) {
         if (mpuTelemetry.camSeq > 0 && camSeq > mpuTelemetry.camSeq + 1) {
             mpuTelemetry.lostCount += camSeq - mpuTelemetry.camSeq - 1;
         }
 
         mpuTelemetry.camSeq = camSeq;
-        mpuTelemetry.roadType = camFields == 6 ? roadType : 0;
         mpuTelemetry.valid = quality > 0.0f;
         mpuTelemetry.gyroZDps = 0.0f;
         mpuTelemetry.confidence = constrain(quality, 0.0f, 1.0f);
@@ -434,16 +371,6 @@ static bool parseS3CamTelemetryBody(const char *body)
         mpuTelemetry.nearOffset = constrain(nearOffset, -1.0f, 1.0f);
         mpuTelemetry.farOffset = constrain(farOffset, -1.0f, 1.0f);
         mpuTelemetry.lastUpdateMs = millis();
-        mpuTelemetry.lastCamUpdateMs = mpuTelemetry.lastUpdateMs;
-        pushCameraFeedForwardSample(
-            camSeq,
-            mpuTelemetry.nearOffset,
-            mpuTelemetry.farOffset,
-            mpuTelemetry.prediction,
-            mpuTelemetry.confidence,
-            mpuTelemetry.roadType,
-            mpuTelemetry.lastCamUpdateMs
-        );
         mpuTelemetry.packetCount++;
         return true;
     }
@@ -463,6 +390,55 @@ int lostLineCount = 0;
 int lastGrayDWeight = 0;
 bool hasGrayDWeight = false;
 
+static void updateUartRxPinScan()
+{
+    if (!ENABLE_UART_RX_PIN_SCAN) {
+        return;
+    }
+
+    constexpr size_t PIN_COUNT = sizeof(UART_RX_SCAN_PINS) / sizeof(UART_RX_SCAN_PINS[0]);
+    static bool initialized = false;
+    static int lastLevels[PIN_COUNT] = {};
+    static uint32_t edgeCounts[PIN_COUNT] = {};
+    static uint32_t lastReportMs = 0;
+
+    if (!initialized) {
+        for (size_t i = 0; i < PIN_COUNT; i++) {
+            pinMode(UART_RX_SCAN_PINS[i], INPUT);
+            lastLevels[i] = digitalRead(UART_RX_SCAN_PINS[i]);
+            edgeCounts[i] = 0;
+        }
+
+        initialized = true;
+        lastReportMs = millis();
+    }
+
+    for (size_t i = 0; i < PIN_COUNT; i++) {
+        int level = digitalRead(UART_RX_SCAN_PINS[i]);
+
+        if (level != lastLevels[i]) {
+            lastLevels[i] = level;
+            edgeCounts[i]++;
+        }
+    }
+
+    uint32_t now = millis();
+
+    if (now - lastReportMs < UART_RX_SCAN_INTERVAL_MS) {
+        return;
+    }
+
+    lastReportMs = now;
+    Serial.print("uart rx scan edges:");
+
+    for (size_t i = 0; i < PIN_COUNT; i++) {
+        Serial.printf(" GPIO%d=%lu", UART_RX_SCAN_PINS[i], static_cast<unsigned long>(edgeCounts[i]));
+        edgeCounts[i] = 0;
+    }
+
+    Serial.println();
+}
+
 static void parseTelemetryLine(const char *packet)
 {
     if (!ENABLE_MPU_TELEMETRY) {
@@ -475,19 +451,136 @@ static void parseTelemetryLine(const char *packet)
         return;
     }
 
-    if (parseS3CamTelemetryBody(body)) {
+    if (strncmp(body, "IMU,", 4) == 0 || strncmp(body, "CAM,", 4) == 0) {
+        if (parseS3CamTelemetryBody(body)) {
+            return;
+        }
+
+        mpuTelemetry.parseFailCount++;
         return;
     }
 
-    mpuTelemetry.parseFailCount++;
+    char tag = '\0';
+    float prediction = 0.0f;
+    float nearOffset = 0.0f;
+    float farOffset = 0.0f;
+    float gyroZ = 0.0f;
+    int valid = 0;
+    int lostCount = 0;
+    float confidence = 0.0f;
 
-    static uint32_t lastBadPacketPrintMs = 0;
-    uint32_t now = millis();
+    int matched = sscanf(
+        body,
+        " %c,%f,%f,%f,%f,%d,%d,%f",
+        &tag,
+        &prediction,
+        &nearOffset,
+        &farOffset,
+        &gyroZ,
+        &valid,
+        &lostCount,
+        &confidence
+    );
 
-    if (now - lastBadPacketPrintMs >= 1000) {
-        lastBadPacketPrintMs = now;
-        Serial.printf("Telemetry parse fail: '%s'\r\n", packet);
+    if (tag == 'G') {
+        int gyroTenths = 0;
+        int compactValid = 0;
+
+        matched = sscanf(body, " G,%d,%d", &gyroTenths, &compactValid);
+
+        if (matched >= 2) {
+            mpuTelemetry.valid = (compactValid != 0);
+            mpuTelemetry.gyroZDps = static_cast<float>(gyroTenths) / 10.0f;
+            mpuTelemetry.confidence = compactValid != 0 ? 1.0f : 0.0f;
+            mpuTelemetry.prediction = 0.0f;
+            mpuTelemetry.nearOffset = 0.0f;
+            mpuTelemetry.farOffset = 0.0f;
+            mpuTelemetry.lostCount = 0;
+            mpuTelemetry.lastUpdateMs = millis();
+            mpuTelemetry.packetCount++;
+            return;
+        }
     }
+
+    if (matched >= 5 && tag == 'P') {
+        mpuTelemetry.valid = (valid != 0);
+        mpuTelemetry.gyroZDps = gyroZ;
+        mpuTelemetry.confidence = confidence;
+        mpuTelemetry.prediction = prediction;
+        mpuTelemetry.nearOffset = nearOffset;
+        mpuTelemetry.farOffset = farOffset;
+        mpuTelemetry.lostCount = lostCount;
+        mpuTelemetry.lastUpdateMs = millis();
+        mpuTelemetry.packetCount++;
+    } else {
+        mpuTelemetry.parseFailCount++;
+
+        static uint32_t lastBadPacketPrintMs = 0;
+        uint32_t now = millis();
+
+        if (now - lastBadPacketPrintMs >= 1000) {
+            lastBadPacketPrintMs = now;
+            Serial.printf("Telemetry parse fail on RX=%d: '", activeTelemetryRxPin);
+
+            for (size_t i = 0; packet[i] != '\0' && i < 80; i++) {
+                char c = packet[i];
+                if (c >= 32 && c <= 126) {
+                    Serial.print(c);
+                } else {
+                    Serial.printf("\\x%02X", static_cast<unsigned char>(c));
+                }
+            }
+
+            Serial.println("'");
+        }
+    }
+}
+
+static void configureI2CTelemetrySlave()
+{
+    int sdaPin = i2cPinSwap ? TELEMETRY_I2C_SCL_PIN : TELEMETRY_I2C_SDA_PIN;
+    int sclPin = i2cPinSwap ? TELEMETRY_I2C_SDA_PIN : TELEMETRY_I2C_SCL_PIN;
+
+    Wire.end();
+    Wire.setBufferSize(128);
+    bool started = Wire.begin(
+        TELEMETRY_I2C_ADDR,
+        sdaPin,
+        sclPin,
+        TELEMETRY_I2C_CLOCK
+    );
+    Wire.setTimeOut(50);
+
+    Wire.onReceive([](int len) {
+        size_t index = 0;
+
+        while (Wire.available() > 0 && index < sizeof(i2cTelemetryLine) - 1) {
+            char c = static_cast<char>(Wire.read());
+
+            if (c == '\r' || c == '\n') {
+                continue;
+            }
+
+            i2cTelemetryLine[index++] = c;
+        }
+
+        while (Wire.available() > 0) {
+            Wire.read();
+        }
+
+        i2cTelemetryLine[index] = '\0';
+        hasI2CTelemetryLine = index > 0;
+        mpuTelemetry.byteCount += len;
+    });
+
+    Serial.printf(
+        "Telemetry I2C slave %s: addr=0x%02X SDA=%d SCL=%d%s\r\n",
+        started ? "enabled" : "FAILED",
+        TELEMETRY_I2C_ADDR,
+        sdaPin,
+        sclPin,
+        i2cPinSwap ? " swapped" : ""
+    );
 }
 
 static void beginTelemetryLink()
@@ -496,13 +589,30 @@ static void beginTelemetryLink()
         return;
     }
 
-    if (TELEMETRY_UART_RX_PIN < 0 ||
-        TELEMETRY_UART_RX_PIN > 39 ||
+    if (ENABLE_PULSE_TELEMETRY) {
+        pinMode(TELEMETRY_UART_RX_PIN, INPUT_PULLUP);
+        lastPulseLevel = digitalRead(TELEMETRY_UART_RX_PIN);
+        Serial.printf(
+            "Telemetry pulse RX enabled: RX=%d\r\n",
+            TELEMETRY_UART_RX_PIN
+        );
+        return;
+    }
+
+    if (ENABLE_I2C_TELEMETRY) {
+        configureI2CTelemetrySlave();
+        return;
+    }
+
+    activeTelemetryRxPin = ENABLE_UART_RX_AUTO_PROBE ? UART_RX_PROBE_PINS[0] : TELEMETRY_UART_RX_PIN;
+
+    if (activeTelemetryRxPin < 0 ||
+        activeTelemetryRxPin > 39 ||
         TELEMETRY_UART_TX_PIN < 0 ||
         TELEMETRY_UART_TX_PIN > 39) {
         Serial.printf(
             "Telemetry UART disabled: invalid ESP32 pins RX=%d TX=%d\r\n",
-            TELEMETRY_UART_RX_PIN,
+            activeTelemetryRxPin,
             TELEMETRY_UART_TX_PIN
         );
         return;
@@ -511,17 +621,118 @@ static void beginTelemetryLink()
     telemetrySerial.begin(
         TELEMETRY_UART_BAUD,
         SERIAL_8N1,
-        TELEMETRY_UART_RX_PIN,
+        activeTelemetryRxPin,
+        TELEMETRY_UART_TX_PIN
+    );
+    resetTelemetryRawSample();
+
+    Serial.printf(
+        "Telemetry UART1 enabled: RX=%d TX=%d baud=%lu%s\r\n",
+        activeTelemetryRxPin,
+        TELEMETRY_UART_TX_PIN,
+        static_cast<unsigned long>(TELEMETRY_UART_BAUD),
+        ENABLE_UART_RX_AUTO_PROBE ? " auto-probe" : ""
+    );
+}
+
+static void completePulseTelemetryPacket()
+{
+    float gyro = static_cast<float>(pulseSign * max(0, pulseCount - 1));
+
+    mpuTelemetry.valid = true;
+    mpuTelemetry.gyroZDps = gyro;
+    mpuTelemetry.confidence = 1.0f;
+    mpuTelemetry.prediction = 0.0f;
+    mpuTelemetry.nearOffset = 0.0f;
+    mpuTelemetry.farOffset = 0.0f;
+    mpuTelemetry.lostCount = 0;
+    mpuTelemetry.lastUpdateMs = millis();
+    mpuTelemetry.packetCount++;
+
+    pulseState = 0;
+    pulseCount = 0;
+    pulseSign = 1;
+}
+
+static void updatePulseTelemetryLink()
+{
+    uint32_t now = millis();
+    int level = digitalRead(TELEMETRY_UART_RX_PIN);
+
+    if (level != lastPulseLevel) {
+        if (level == LOW) {
+            pulseLowStartMs = now;
+        } else {
+            uint32_t lowMs = now - pulseLowStartMs;
+
+            if (lowMs >= 220) {
+                pulseState = 1;
+                pulseCount = 0;
+                pulseSign = 1;
+                mpuTelemetry.byteCount++;
+            } else if (pulseState == 1 && lowMs >= 80) {
+                pulseSign = (lowMs >= 150) ? -1 : 1;
+                pulseState = 2;
+                lastPulseEdgeMs = now;
+                mpuTelemetry.byteCount++;
+            } else if (pulseState == 2 && lowMs >= 70) {
+                pulseCount++;
+                lastPulseEdgeMs = now;
+                mpuTelemetry.byteCount++;
+            }
+        }
+
+        lastPulseLevel = level;
+    }
+
+    if (pulseState == 2 && pulseCount > 0 && now - lastPulseEdgeMs >= 500) {
+        completePulseTelemetryPacket();
+    }
+}
+
+static void updateTelemetryRxProbe()
+{
+    if (!ENABLE_MPU_TELEMETRY || !ENABLE_UART_RX_AUTO_PROBE || mpuTelemetry.packetCount > 0) {
+        return;
+    }
+
+    uint32_t now = millis();
+
+    if (now - lastTelemetryProbeMs < UART_RX_PROBE_INTERVAL_MS) {
+        return;
+    }
+
+    lastTelemetryProbeMs = now;
+
+    constexpr size_t PIN_COUNT = sizeof(UART_RX_PROBE_PINS) / sizeof(UART_RX_PROBE_PINS[0]);
+    static size_t probeIndex = 0;
+
+    probeIndex = (probeIndex + 1) % PIN_COUNT;
+    printTelemetryRawSample("Telemetry probe sample");
+    activeTelemetryRxPin = UART_RX_PROBE_PINS[probeIndex];
+
+    if (activeTelemetryRxPin < 0 || activeTelemetryRxPin > 39) {
+        Serial.printf("Telemetry UART probe skipped invalid RX=%d\r\n", activeTelemetryRxPin);
+        return;
+    }
+
+    telemetryLineLen = 0;
+    resetTelemetryRawSample();
+    telemetrySerial.end();
+    telemetrySerial.begin(
+        TELEMETRY_UART_BAUD,
+        SERIAL_8N1,
+        activeTelemetryRxPin,
         TELEMETRY_UART_TX_PIN
     );
 
     Serial.printf(
-        "Telemetry UART2 enabled: RX=%d TX=%d baud=%lu\r\n",
-        TELEMETRY_UART_RX_PIN,
-        TELEMETRY_UART_TX_PIN,
-        static_cast<unsigned long>(TELEMETRY_UART_BAUD)
+        "Telemetry UART probing RX=%d bytes=%lu packets=%lu parseFail=%lu\r\n",
+        activeTelemetryRxPin,
+        static_cast<unsigned long>(mpuTelemetry.byteCount),
+        static_cast<unsigned long>(mpuTelemetry.packetCount),
+        static_cast<unsigned long>(mpuTelemetry.parseFailCount)
     );
-    Serial.println("Wire: S3 GPIO45 TX -> V1 GPIO22 RX, S3 GPIO46 RX <- V1 GPIO23 TX, common GND.");
 }
 
 static void updateTelemetryLink()
@@ -530,9 +741,42 @@ static void updateTelemetryLink()
         return;
     }
 
+    if (ENABLE_PULSE_TELEMETRY) {
+        updatePulseTelemetryLink();
+        return;
+    }
+
+    if (ENABLE_I2C_TELEMETRY) {
+        uint32_t now = millis();
+
+        if (mpuTelemetry.byteCount == 0 &&
+            mpuTelemetry.packetCount == 0 &&
+            now - lastI2CReprobeMs >= 2500) {
+            lastI2CReprobeMs = now;
+            i2cPinSwap = !i2cPinSwap;
+            configureI2CTelemetrySlave();
+        }
+
+        if (hasI2CTelemetryLine) {
+            char packet[128];
+
+            noInterrupts();
+            strncpy(packet, i2cTelemetryLine, sizeof(packet));
+            packet[sizeof(packet) - 1] = '\0';
+            hasI2CTelemetryLine = false;
+            interrupts();
+
+            parseTelemetryLine(packet);
+        }
+
+        return;
+    }
+
     while (telemetrySerial.available() > 0) {
         char c = static_cast<char>(telemetrySerial.read());
         mpuTelemetry.byteCount++;
+        lastTelemetryByteMs = millis();
+        recordTelemetryRawByte(static_cast<uint8_t>(c));
 
         if (c == '\r') {
             continue;
@@ -556,24 +800,24 @@ static void updateTelemetryLink()
             mpuTelemetry.parseFailCount++;
         }
     }
+
+    if (telemetryLineLen >= 5 &&
+        (telemetryLine[0] == 'P' || telemetryLine[0] == 'G') &&
+        telemetryLine[1] == ',' &&
+        millis() - lastTelemetryByteMs >= 1000) {
+        telemetryLine[telemetryLineLen] = '\0';
+        parseTelemetryLine(telemetryLine);
+        telemetryLineLen = 0;
+    }
 }
 
 static bool mpuTelemetryFresh()
 {
-    if (mpuTelemetry.lastImuUpdateMs == 0) {
+    if (!mpuTelemetry.valid) {
         return false;
     }
 
-    return (millis() - mpuTelemetry.lastImuUpdateMs) <= TELEMETRY_TIMEOUT_MS;
-}
-
-static bool cameraTelemetryFresh()
-{
-    if (mpuTelemetry.lastCamUpdateMs == 0) {
-        return false;
-    }
-
-    return (millis() - mpuTelemetry.lastCamUpdateMs) <= TELEMETRY_TIMEOUT_MS;
+    return (millis() - mpuTelemetry.lastUpdateMs) <= TELEMETRY_TIMEOUT_MS;
 }
 
 void setup() {
@@ -604,7 +848,8 @@ void setup() {
 
 void loop() {
     updateTelemetryLink();
-    uint32_t now = millis();
+    updateTelemetryRxProbe();
+    updateUartRxPinScan();
 
     leftEncoder.update();
     rightEncoder.update();
@@ -668,35 +913,6 @@ void loop() {
     float controlTurnWeight = static_cast<float>(turnWeight);
     float grayDCorrection = 0.0f;
     float gyroCorrection = 0.0f;
-    CameraFeedForwardSample delayedCameraSample;
-    bool cameraSpeedActive = getDelayedCameraFeedForwardSample(now, delayedCameraSample);
-    float cameraCurveValue = cameraSpeedActive ? cameraCurveMetric(delayedCameraSample) : 0.0f;
-    bool cameraRightAngleAhead = cameraSpeedActive && delayedCameraSample.roadType == 3;
-    bool cameraSCurveAhead = cameraSpeedActive && delayedCameraSample.roadType == 2;
-    bool cameraNormalCurveAhead = cameraSpeedActive && delayedCameraSample.roadType == 4;
-    bool cameraStraightAhead = cameraSpeedActive && delayedCameraSample.roadType == 1;
-    bool cameraCurveAhead = cameraSpeedActive &&
-        (cameraSCurveAhead ||
-         cameraNormalCurveAhead ||
-         cameraRightAngleAhead ||
-         (delayedCameraSample.roadType == 0 && cameraCurveValue >= CAMERA_CURVE_THRESHOLD));
-    bool cameraHardCurveAhead = cameraSpeedActive &&
-        (cameraRightAngleAhead ||
-         (delayedCameraSample.roadType == 0 && cameraCurveValue >= CAMERA_HARD_CURVE_THRESHOLD));
-    bool grayCurveNow = lineSeen && abs(turnWeight) >= GRAY_CURVE_SPEED_TURN_WEIGHT;
-    int dynamicBaseSpeed = grayCurveNow ? CAMERA_CURVE_SPEED : BASE_SPEED;
-
-    if (cameraSpeedActive) {
-        if (cameraHardCurveAhead) {
-            dynamicBaseSpeed = CAMERA_HARD_CURVE_SPEED;
-        } else if (cameraSCurveAhead) {
-            dynamicBaseSpeed = CAMERA_S_CURVE_SPEED;
-        } else if (cameraStraightAhead) {
-            dynamicBaseSpeed = CAMERA_STRAIGHT_SPEED;
-        } else {
-            dynamicBaseSpeed = cameraCurveAhead ? CAMERA_CURVE_SPEED : CAMERA_STRAIGHT_SPEED;
-        }
-    }
 
     if (realLost) {
         // 真丢线时，按上一次偏左/偏右的方向去找回黑线
@@ -706,19 +922,16 @@ void loop() {
             finalTurnWeight = -LOST_TURN_WEIGHT;
         }
         controlTurnWeight = static_cast<float>(finalTurnWeight);
-        dynamicBaseSpeed = CAMERA_HARD_CURVE_SPEED;
 
     } else if (hardLeft) {
         // 左直角弯：直接给一个固定的强转向权重
         finalTurnWeight = -HARD_TURN_WEIGHT;
         controlTurnWeight = static_cast<float>(finalTurnWeight);
-        dynamicBaseSpeed = CAMERA_HARD_CURVE_SPEED;
 
     } else if (hardRight) {
         // 右直角弯：直接给一个固定的强转向权重
         finalTurnWeight = HARD_TURN_WEIGHT;
         controlTurnWeight = static_cast<float>(finalTurnWeight);
-        dynamicBaseSpeed = CAMERA_HARD_CURVE_SPEED;
 
     } else {
         // 普通循迹：直接使用灰度传感器算出来的转向权重
@@ -759,18 +972,45 @@ void loop() {
     }
 
     finalTurnWeight = static_cast<int>(lroundf(controlTurnWeight));
+    // int speedDelta = static_cast<int>(lroundf(TURN_SPEED_STEP * controlTurnWeight));
+
+    int effectiveBaseSpeed = BASE_SPEED;
+
+    if (realLost || hardLeft || hardRight) {
+        effectiveBaseSpeed = 50;
+    } else if (lineSeen && abs(turnWeight) >= 4) {
+        effectiveBaseSpeed = 55;
+    } else if (lineSeen && abs(turnWeight) >= 2) {
+        effectiveBaseSpeed = 65;
+    }
+
+    // ===== 转向死区：消除小幅度抖动 =====
+    const float TURN_DEADZONE = 0.3f;   // 建议 0.05~0.1，根据传感器噪声调整
+
+// 原始转向指令（已包含灰度、MPU等修正）
+    float controlTurnWeightRaw = controlTurnWeight;  // 即您之前计算出的最终 controlTurnWeight
+
+    // 应用死区
+    if (fabs(controlTurnWeightRaw) < TURN_DEADZONE) {
+        controlTurnWeight = 0.0f;   // 强制归零，相当于直道
+    } else {
+        controlTurnWeight = controlTurnWeightRaw;   // 保持原值
+    }
+    // =====================================
+
+    // 然后计算 speedDelta（基于修正后的 controlTurnWeight）
     int speedDelta = static_cast<int>(lroundf(TURN_SPEED_STEP * controlTurnWeight));
+    int maxSpeedDelta = effectiveBaseSpeed + 10;
 
-    // 速度差公式：
-    // turnWeight > 0 时，右轮更快，车身向右修正
-    // turnWeight < 0 时，左轮更快，车身向左修正
-    int leftSpeed = dynamicBaseSpeed - speedDelta;
-    int rightSpeed = dynamicBaseSpeed + speedDelta;
+    if (realLost || hardLeft || hardRight) {
+        maxSpeedDelta = 95;
+    }
 
-    // 左电机通常会比右电机略快一点，这里做整体补偿
+    speedDelta = constrain(speedDelta, -maxSpeedDelta, maxSpeedDelta);
+    int leftSpeed = effectiveBaseSpeed - speedDelta;
+    int rightSpeed = effectiveBaseSpeed + speedDelta;
+
     leftSpeed += LEFT_SPEED_TRIM;
-
-    // 限制输出范围，避免速度超出电机允许值
     leftSpeed = -constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
     rightSpeed = -constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
 
@@ -781,98 +1021,51 @@ void loop() {
 
     static uint32_t lastPrintMs = 0;
     static uint32_t lastTraceMs = 0;
-    bool imuFresh = mpuTelemetryFresh();
-    bool camFresh = cameraTelemetryFresh();
-    uint32_t imuAge = mpuTelemetry.lastImuUpdateMs > 0
-        ? now - mpuTelemetry.lastImuUpdateMs
-        : 0;
-    uint32_t camAge = mpuTelemetry.lastCamUpdateMs > 0
-        ? now - mpuTelemetry.lastCamUpdateMs
-        : 0;
-    uint32_t cameraSpeedAge = cameraSpeedActive
-        ? now - delayedCameraSample.timeMs
-        : 0;
+    uint32_t now = millis();
 
     if (now - lastPrintMs >= PRINT_INTERVAL_MS) {
         lastPrintMs = now;
-        const char *lineState = lineSeen ? "ON" : "LOST";
-        const char *turnHint = "MID";
-
-        if (finalTurnWeight < 0) {
-            turnHint = "LEFT";
-        } else if (finalTurnWeight > 0) {
-            turnHint = "RIGHT";
-        }
-
         Serial.printf(
-            "LINE %s gray=%d turn=%s hardL=%d hardR=%d lost=%d | MOTOR L=%d R=%d base=%d ctrl=%.2f grayD=%.2f camType=%s camCurve=%d hardCam=%d grayCurve=%d curveM=%.2f\r\n",
-            lineState,
+            "t=%lu gray=%d line=%d hardL=%d hardR=%d lost=%d base=%d grayD=%.2f gyro=%.2f corr=%.2f %s=%s rx=%d bytes=%lu pkt=%lu age=%lu valid=%d conf=%.2f turn=%d ctrl=%.2f L=%d R=%d\r\n",
+            static_cast<unsigned long>(now),
             turnWeight,
-            turnHint,
+            lineSeen ? 1 : 0,
             hardLeft ? 1 : 0,
             hardRight ? 1 : 0,
             realLost ? 1 : 0,
-            leftSpeed,
-            rightSpeed,
-            dynamicBaseSpeed,
-            controlTurnWeight,
+            effectiveBaseSpeed,
             grayDCorrection,
-            cameraRoadTypeName(cameraSpeedActive ? delayedCameraSample.roadType : 0),
-            cameraCurveAhead ? 1 : 0,
-            cameraHardCurveAhead ? 1 : 0,
-            grayCurveNow ? 1 : 0,
-            cameraCurveValue
-        );
-        Serial.printf(
-            "CAM %s age=%lums speedAge=%lums speedSeq=%d type=%s near=%.2f far=%.2f center=%.2f lineQ=%.2f\r\n",
-            camFresh ? "OK" : "WAIT",
-            static_cast<unsigned long>(camAge),
-            static_cast<unsigned long>(cameraSpeedAge),
-            cameraSpeedActive ? delayedCameraSample.seq : 0,
-            cameraRoadTypeName(mpuTelemetry.roadType),
-            mpuTelemetry.nearOffset,
-            mpuTelemetry.farOffset,
-            mpuTelemetry.prediction,
-            mpuTelemetry.confidence
-        );
-        Serial.printf(
-            "MPU %s age=%lums seq=%d gyroZ=%.2f corr=%.2f | UART bytes=%lu packets=%lu bad=%lu lost=%d\r\n",
-            imuFresh ? "OK" : "WAIT",
-            static_cast<unsigned long>(imuAge),
-            mpuTelemetry.imuSeq,
-            imuFresh ? mpuTelemetry.gyroZDps : 0.0f,
+            mpuTelemetryFresh() ? mpuTelemetry.gyroZDps : 0.0f,
             gyroCorrection,
+            ENABLE_I2C_TELEMETRY ? "i2c" : "uart",
+            mpuTelemetryFresh() ? "ok" : "wait",
+            activeTelemetryRxPin,
             static_cast<unsigned long>(mpuTelemetry.byteCount),
             static_cast<unsigned long>(mpuTelemetry.packetCount),
-            static_cast<unsigned long>(mpuTelemetry.parseFailCount),
-            mpuTelemetry.lostCount
-        );
-        Serial.printf(
-            "RAW t=%lu rx=%d uart=%s base=%d lineQ=%.2f\r\n",
-            static_cast<unsigned long>(now),
-            TELEMETRY_UART_RX_PIN,
-            (imuFresh || camFresh) ? "OK" : "WAIT",
-            dynamicBaseSpeed,
-            mpuTelemetry.confidence
+            mpuTelemetry.valid ? static_cast<unsigned long>(now - mpuTelemetry.lastUpdateMs) : 0UL,
+            mpuTelemetry.valid ? 1 : 0,
+            mpuTelemetry.confidence,
+            finalTurnWeight,
+            controlTurnWeight,
+            leftSpeed,
+            rightSpeed
         );
     }
 
     if (ENABLE_SERIAL_TRACE && now - lastTraceMs >= SERIAL_TRACE_INTERVAL_MS) {
         lastTraceMs = now;
         Serial.printf(
-            "VISION_RAW type=%s center=%.3f near=%.3f far=%.3f lineQ=%.2f camCurve=%d curveM=%.3f speedAge=%lu base=%d camAge=%lu imuGyro=%.2f imuAge=%lu\r\n",
-            cameraRoadTypeName(mpuTelemetry.roadType),
+            "mpu raw: pred=%.3f near=%.3f far=%.3f gyro=%.2f valid=%d age=%lu rx=%d bytes=%lu packets=%lu parseFail=%lu\n",
             mpuTelemetry.prediction,
             mpuTelemetry.nearOffset,
             mpuTelemetry.farOffset,
-            mpuTelemetry.confidence,
-            cameraCurveAhead ? 1 : 0,
-            cameraCurveValue,
-            static_cast<unsigned long>(cameraSpeedAge),
-            dynamicBaseSpeed,
-            static_cast<unsigned long>(camAge),
             mpuTelemetry.gyroZDps,
-            static_cast<unsigned long>(imuAge)
+            mpuTelemetry.valid ? 1 : 0,
+            mpuTelemetry.valid ? static_cast<unsigned long>(now - mpuTelemetry.lastUpdateMs) : 0UL,
+            activeTelemetryRxPin,
+            static_cast<unsigned long>(mpuTelemetry.byteCount),
+            static_cast<unsigned long>(mpuTelemetry.packetCount),
+            static_cast<unsigned long>(mpuTelemetry.parseFailCount)
         );
     }
 

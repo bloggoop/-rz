@@ -1,4 +1,6 @@
+
 #pragma once
+//7.9 game_use
 
 // =========================
 // 基础硬件参数
@@ -17,14 +19,14 @@ constexpr int LEFT_SPEED_TRIM = -2;
 
 // 基础前进速度。
 // 太容易冲出去就调小，跑得太慢就调大。
-constexpr int BASE_SPEED = 75;
+constexpr int BASE_SPEED = 100;
 
 // 最大速度限制，防止输出过大。
-constexpr int MAX_SPEED = 80;
+constexpr int MAX_SPEED = 180;
 
 // 普通循迹转向力度。
 // 这里相当于差速转向的 P：弯转不过就加大，左右抖就减小。
-constexpr int TURN_SPEED_STEP = 20;
+constexpr int TURN_SPEED_STEP = 25;
 
 
 // 是否启用 V1 本地灰度 PD 的 D 项。
@@ -33,14 +35,14 @@ constexpr bool ENABLE_GRAY_D_CORRECTION = true;
 
 // 灰度误差变化量对转向的阻尼强度。
 // 太抖就加大一点；入弯变钝或转不过就减小。
-constexpr float GRAY_D_GAIN = 25.0f;
+constexpr float GRAY_D_GAIN = 27.0f;
 
 // 灰度 D 单次最大修正，防止权重跳变时一把修过头。
 constexpr float GRAY_D_CORRECTION_CLAMP =35.0f;
 
 // 直角弯时使用的强制转向权重。
 // 转出去或甩头就降低；直角转不过再升。
-constexpr int HARD_TURN_WEIGHT = 50;
+constexpr int HARD_TURN_WEIGHT = 70;
 
 // 丢线找线时使用的转向权重。
 // 丢线后找不回来就升到 5；乱甩就降到 3
@@ -48,7 +50,7 @@ constexpr int LOST_TURN_WEIGHT = 5;
 
 // 连续检测到几次外侧压线，才认为是直角弯
 // 抖动和误识别时用 2 或 3；响应太慢再降到 1。
-constexpr int HARD_CONFIRM_COUNT = 2;
+constexpr int HARD_CONFIRM_COUNT = 1;
 
 // 连续丢线几次，才进入丢线找线
 // 误触发 LOST 就升到 4；丢线救不回来就降到 2
@@ -64,13 +66,33 @@ constexpr int LOOP_DELAY_MS = 5;
 
 // 是否启用 S3 -> V1 的 MPU/CAM 串口接收链路。
 // 当前使用文本行协议：IMU,seq,pitch,roll,yawOrGyro*CRC
-constexpr bool ENABLE_MPU_TELEMETRY = false;
+constexpr bool ENABLE_MPU_TELEMETRY = true;
+constexpr bool ENABLE_PULSE_TELEMETRY = false;
+
+// 使用 I2C 接收 S3 的 MPU 数据。
+// 接线：S3 GPIO47 -> V1 GPIO22 (SDA)，S3 GPIO21 -> V1 GPIO23 (SCL)，两板 GND 共地。
+constexpr bool ENABLE_I2C_TELEMETRY = false;
+constexpr uint8_t TELEMETRY_I2C_ADDR = 0x12;
+constexpr int TELEMETRY_I2C_SDA_PIN = 22;
+constexpr int TELEMETRY_I2C_SCL_PIN = 23;
+constexpr uint32_t TELEMETRY_I2C_CLOCK = 100000;
 
 // V1 板 UART1 引脚。
 // 接线：S3 GPIO45 TX -> V1 GPIO22 RX，S3 GPIO46 RX <- V1 GPIO23 TX，两板 GND 共地。
 constexpr int TELEMETRY_UART_RX_PIN = 22;
 constexpr int TELEMETRY_UART_TX_PIN = 23;
 constexpr uint32_t TELEMETRY_UART_BAUD = 115200;
+
+// 通信没收到字节时，扫描这些普通 ESP32 合法空闲脚上的电平跳变。
+// 把 S3_TX 接到不同 V1 排针时，看日志里哪个 GPIO 的 edges 明显增加。
+constexpr bool ENABLE_UART_RX_PIN_SCAN = false;
+constexpr int UART_RX_SCAN_PINS[] = {4, 5, 21, 23, 26, 36, 39};
+constexpr uint32_t UART_RX_SCAN_INTERVAL_MS = 1000;
+
+// 自动轮询候选 RX 脚，哪个脚真正收到 UART 字节就停在哪个脚。
+constexpr bool ENABLE_UART_RX_AUTO_PROBE = false;
+constexpr int UART_RX_PROBE_PINS[] = {26, 36, 39, 23, 21, 5, 4};
+constexpr uint32_t UART_RX_PROBE_INTERVAL_MS = 1500;
 
 // 车端接收到的 MPU 数据多久没更新就认为失效。
 constexpr uint32_t TELEMETRY_TIMEOUT_MS = 300;
@@ -93,41 +115,8 @@ constexpr int MPU_D_MAX_TURN_WEIGHT = 2;
 // MPU 单次纠偏最大幅度，防止一次修正过头。
 constexpr float MPU_D_CORRECTION_CLAMP = 1.5f;
 
-// 是否用 S3 相机做速度前馈：前方直道加速，前方弯道减速。
-// 相机装得高、看得远，所以这里会延迟一段时间再改变速度。
-constexpr bool ENABLE_CAMERA_SPEED_FEED_FORWARD = true;
-
-// 相机速度前馈延时。相机越靠前/越高，这个值越大；车速越快，这个值越小。
-constexpr uint32_t CAMERA_SPEED_DELAY_MS = 80;
-
-// 低于这个线质量就不使用相机调速。
-constexpr float CAMERA_SPEED_MIN_LINE_QUALITY = 0.45f;
-
-// 认为前方是弯道的视觉偏移阈值。
-// near/far/center 任一明显偏离或上下变化明显，就会减速。
-constexpr float CAMERA_CURVE_THRESHOLD = 0.24f;
-
-// 认为前方是强弯/直角弯的视觉偏移阈值。
-constexpr float CAMERA_HARD_CURVE_THRESHOLD = 0.45f;
-
-// 相机看到前方直道时使用的速度。
-constexpr int CAMERA_STRAIGHT_SPEED = 78;
-
-// 相机看到弯道时使用的速度。
-constexpr int CAMERA_CURVE_SPEED = 70;
-
-// 相机看到 S 弯时使用的速度。
-constexpr int CAMERA_S_CURVE_SPEED = 70;
-
-// 相机看到强弯/直角弯时使用的速度。
-constexpr int CAMERA_HARD_CURVE_SPEED = 55;
-
-// V1 本地灰度已经看到明显转向时，也立刻使用弯道速度。
-// 这用于兜底相机漏判/晚判，避免大直道高速进弯收不住。
-constexpr int GRAY_CURVE_SPEED_TURN_WEIGHT = 2;
-
 // 是否在串口里打印更详细的 MPU/循迹状态。
-constexpr bool ENABLE_SERIAL_TRACE = false;
+constexpr bool ENABLE_SERIAL_TRACE = true;
 
 // 详细日志的打印间隔。
 constexpr uint32_t SERIAL_TRACE_INTERVAL_MS = 100;
@@ -140,7 +129,7 @@ constexpr int PRINT_INTERVAL_MS = 200;
 constexpr int GRAY_SENSOR_PINS[5] = {33, 32, 35, 34, 27};
 // 灰度传感器触发阈值。
 // 读数高于这个值就认为压到线了。
-constexpr int GRAY_THRESHOLD = 600;
+constexpr int GRAY_THRESHOLD = 2000;
 
 // 五个灰度传感器对应的转向权重：
 // 左外、左内、中、右内、右外。
@@ -148,7 +137,7 @@ constexpr int GRAY_THRESHOLD = 600;
 constexpr int GRAY_SENSOR_WEIGHTS[5] = {-4, -2, 0, 2, 4};
 
 // 指示灯 PWM 参数
-// GPIO22 已作为 UART RX，调 MPU 阶段先关闭 V1 呼吸灯。
+// GPIO22 已作为 I2C SDA，调 MPU 阶段先关闭 V1 呼吸灯。
 constexpr int LED_PIN = -1;
 constexpr int LED_PWM_FREQ = 1000;
 constexpr int LED_BREATH_STEP = 24;
