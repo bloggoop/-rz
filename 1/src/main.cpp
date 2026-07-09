@@ -17,7 +17,7 @@ public:
     }
 
     void setSpeed(int speed) {
-        speed = constrain(speed, -180, 180);
+        speed = constrain(speed, -100, 100);
 
         if (reversed) {
             speed = -speed;
@@ -974,18 +974,17 @@ void loop() {
     finalTurnWeight = static_cast<int>(lroundf(controlTurnWeight));
     // int speedDelta = static_cast<int>(lroundf(TURN_SPEED_STEP * controlTurnWeight));
 
-    int effectiveBaseSpeed = BASE_SPEED;
+    int effectiveBaseSpeed = STRAIGHT_SPEED;
 
     if (realLost || hardLeft || hardRight) {
-        effectiveBaseSpeed = 50;
-    } else if (lineSeen && abs(turnWeight) >= 4) {
-        effectiveBaseSpeed = 55;
-    } else if (lineSeen && abs(turnWeight) >= 2) {
-        effectiveBaseSpeed = 65;
+        effectiveBaseSpeed = HARD_OR_LOST_SPEED;
+    } else if (lineSeen && abs(turnWeight) >= BIG_CURVE_TURN_WEIGHT) {
+        effectiveBaseSpeed = BIG_CURVE_SPEED;
+    } else if (lineSeen && abs(turnWeight) >= SMALL_CURVE_TURN_WEIGHT) {
+        effectiveBaseSpeed = SMALL_CURVE_SPEED;
     }
 
     // ===== 转向死区：消除小幅度抖动 =====
-    const float TURN_DEADZONE = 0.3f;   // 建议 0.05~0.1，根据传感器噪声调整
 
 // 原始转向指令（已包含灰度、MPU等修正）
     float controlTurnWeightRaw = controlTurnWeight;  // 即您之前计算出的最终 controlTurnWeight
@@ -1000,10 +999,10 @@ void loop() {
 
     // 然后计算 speedDelta（基于修正后的 controlTurnWeight）
     int speedDelta = static_cast<int>(lroundf(TURN_SPEED_STEP * controlTurnWeight));
-    int maxSpeedDelta = effectiveBaseSpeed + 10;
+    int maxSpeedDelta = effectiveBaseSpeed + NORMAL_TURN_DELTA_MARGIN;
 
     if (realLost || hardLeft || hardRight) {
-        maxSpeedDelta = 95;
+        maxSpeedDelta = HARD_OR_LOST_MAX_SPEED_DELTA;
     }
 
     speedDelta = constrain(speedDelta, -maxSpeedDelta, maxSpeedDelta);

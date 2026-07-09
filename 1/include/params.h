@@ -19,14 +19,45 @@ constexpr int LEFT_SPEED_TRIM = -2;
 
 // 基础前进速度。
 // 太容易冲出去就调小，跑得太慢就调大。
-constexpr int BASE_SPEED = 100;
+constexpr int BASE_SPEED = 65;
 
 // 最大速度限制，防止输出过大。
-constexpr int MAX_SPEED = 180;
+constexpr int MAX_SPEED = 80;
 
 // 普通循迹转向力度。
 // 这里相当于差速转向的 P：弯转不过就加大，左右抖就减小。
 constexpr int TURN_SPEED_STEP = 25;
+
+// =========================
+// 比赛速度分档参数
+// =========================
+
+// 当前直道速度。直道接弯飞出去就继续降。
+constexpr int STRAIGHT_SPEED = 74;
+
+// 轻微入弯/小修正速度，对应 abs(turnWeight) >= SMALL_CURVE_TURN_WEIGHT。
+constexpr int SMALL_CURVE_SPEED = 50;
+
+// 大弯速度，对应 abs(turnWeight) >= BIG_CURVE_TURN_WEIGHT。
+constexpr int BIG_CURVE_SPEED = 45;
+
+// 直角弯/丢线找线速度。
+constexpr int HARD_OR_LOST_SPEED = 60;
+
+// 灰度权重到这个值开始认为是小弯/入弯。
+constexpr int SMALL_CURVE_TURN_WEIGHT = 2;
+
+// 灰度权重到这个值开始认为是大弯。
+constexpr int BIG_CURVE_TURN_WEIGHT = 4;
+
+// 普通弯差速上限：effectiveBaseSpeed + NORMAL_TURN_DELTA_MARGIN。
+constexpr int NORMAL_TURN_DELTA_MARGIN = 10;
+
+// 直角弯/丢线时允许更大的差速。
+constexpr int HARD_OR_LOST_MAX_SPEED_DELTA = 200;
+
+// 转向死区，小于这个控制量时当作直行。
+constexpr float TURN_DEADZONE = 0.3f;
 
 
 // 是否启用 V1 本地灰度 PD 的 D 项。
@@ -35,14 +66,14 @@ constexpr bool ENABLE_GRAY_D_CORRECTION = true;
 
 // 灰度误差变化量对转向的阻尼强度。
 // 太抖就加大一点；入弯变钝或转不过就减小。
-constexpr float GRAY_D_GAIN = 27.0f;
+constexpr float GRAY_D_GAIN = 16.0f;
 
 // 灰度 D 单次最大修正，防止权重跳变时一把修过头。
-constexpr float GRAY_D_CORRECTION_CLAMP =35.0f;
+constexpr float GRAY_D_CORRECTION_CLAMP = 18.0f;
 
 // 直角弯时使用的强制转向权重。
 // 转出去或甩头就降低；直角转不过再升。
-constexpr int HARD_TURN_WEIGHT = 70;
+constexpr int HARD_TURN_WEIGHT = 95;
 
 // 丢线找线时使用的转向权重。
 // 丢线后找不回来就升到 5；乱甩就降到 3
@@ -58,7 +89,7 @@ constexpr int LOST_CONFIRM_COUNT = 4;
 
 // 主循环延时
 // 3ms 反应更快；太抖再加到 5ms。
-constexpr int LOOP_DELAY_MS = 5;
+constexpr int LOOP_DELAY_MS = 3;
 
 // =========================
 // MPU / S3 串口联动参数
