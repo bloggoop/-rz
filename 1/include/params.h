@@ -17,30 +17,35 @@ constexpr int LEFT_SPEED_TRIM = -2;
 
 // 基础前进速度。
 // 太容易冲出去就调小，跑得太慢就调大。
-constexpr int BASE_SPEED = 72;
+constexpr int BASE_SPEED = 80;
 
 // 最大速度限制，防止输出过大。
 constexpr int MAX_SPEED = 90;
 
 // 普通循迹转向力度。
 // 这里相当于差速转向的 P：弯转不过就加大，左右抖就减小。
-constexpr int TURN_SPEED_STEP = 25;
+constexpr int TURN_SPEED_STEP = 18;
 
+// 是否启用直道锁中。中间探头在线且左右外侧没压线时，不做小幅修正。
+constexpr bool ENABLE_STRAIGHT_CENTER_LOCK = true;
+
+// 连续检测到几次直道状态，才进入锁中。避免弯道入口/传感器临界值来回切换。
+constexpr int STRAIGHT_LOCK_CONFIRM_COUNT = 3;
 
 // 是否启用 V1 本地灰度 PD 的 D 项。
-// 默认关闭，保持当前稳定巡线行为；要抑制小幅摆头时再打开。
+// 使用拟合后的连续目标线误差，D 项可以重新启用。
 constexpr bool ENABLE_GRAY_D_CORRECTION = true;
 
 // 灰度误差变化量对转向的阻尼强度。
 // 太抖就加大一点；入弯变钝或转不过就减小。
-constexpr float GRAY_D_GAIN = 27.0f;
+constexpr float GRAY_D_GAIN = 10.0f;
 
 // 灰度 D 单次最大修正，防止权重跳变时一把修过头。
-constexpr float GRAY_D_CORRECTION_CLAMP = 35.0f;
+constexpr float GRAY_D_CORRECTION_CLAMP = 12.0f;
 
 // 直角弯时使用的强制转向权重。
 // 转出去或甩头就降低；直角转不过再升。
-constexpr int HARD_TURN_WEIGHT = 70;
+constexpr int HARD_TURN_WEIGHT = 62;
 
 // 丢线找线时使用的转向权重。
 // 丢线后找不回来就升到 5；乱甩就降到 3
@@ -56,7 +61,7 @@ constexpr int LOST_CONFIRM_COUNT = 4;
 
 // 主循环延时
 // 3ms 反应更快；太抖再加到 5ms。
-constexpr int LOOP_DELAY_MS = 5;
+constexpr int LOOP_DELAY_MS = 3;
 
 // 串口打印间隔
 constexpr int PRINT_INTERVAL_MS = 200;

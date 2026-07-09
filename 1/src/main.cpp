@@ -147,35 +147,37 @@ public:
         }
     }
 
-    int readTurnWeight(int values[5], bool active[5], int &activeCount) {
+    float readTurnWeight(int values[5], bool active[5], int &activeCount) {
         readRaw(values);
 
-        int weightSum = 0;
+        float weightedSum = 0.0f;
+        float signalSum = 0.0f;
         activeCount = 0;
 
         for (int i = 0; i < 5; i++) {
             active[i] = values[i] > GRAY_THRESHOLD;
 
             if (active[i]) {
-                weightSum += GRAY_SENSOR_WEIGHTS[i];
+                float signal = static_cast<float>(values[i] - GRAY_THRESHOLD);
+                weightedSum += static_cast<float>(GRAY_SENSOR_WEIGHTS[i]) * signal;
+                signalSum += signal;
                 activeCount++;
             }
         }
 
-        if (activeCount == 0) {
+        if (signalSum <= 0.0f) {
             return lastTurnWeight;
         }
 
-        // 多个传感器同时压线时取平均
-        // 防止 S 弯、宽线时突然猛甩
-        int turnWeight = weightSum / activeCount;
+        // 使用模拟量强度拟合目标线位置，保留连续误差，减少二值跳变带来的抖动。
+        float turnWeight = weightedSum / signalSum;
 
         lastTurnWeight = turnWeight;
         return turnWeight;
     }
 
 private:
-    int lastTurnWeight = 0;
+    float lastTurnWeight = 0.0f;
 };
 
 Motor leftMotor(LEFT_MOTOR_PINS[0], LEFT_MOTOR_PINS[1], 0, 1, true);
@@ -196,8 +198,9 @@ int lastTurnDir = 1;
 int leftHardCount = 0;
 int rightHardCount = 0;
 int lostLineCount = 0;
-int lastGrayDWeight = 0;
+float lastGrayDWeight = 0.0f;
 bool hasGrayDWeight = false;
+int straightLockCount = 0;
 
 void setup() {
     Serial.begin(115200);
@@ -230,7 +233,7 @@ void loop() {
     bool active[5];
     int activeCount = 0;
 
-    int turnWeight = gray.readTurnWeight(values, active, activeCount);
+    float turnWeight = gray.readTurnWeight(values, active, activeCount);
 
     bool lineSeen = activeCount > 0;
 
@@ -266,6 +269,13 @@ void loop() {
     bool hardRight = rightHardCount >= HARD_CONFIRM_COUNT;
     bool realLost = lostLineCount >= LOST_CONFIRM_COUNT;
 
+    bool straightCandidate = active[2] && !active[0] && !active[1] && !active[3] && !active[4] && !hardLeft && !hardRight;
+    if (straightCandidate) {
+        straightLockCount++;
+    } else {
+        straightLockCount = 0;
+    }
+
     // 只在当前确实看到线时，更新“上一次偏左/偏右”的记忆
     if (lineSeen) {
         if (hardLeft) {
@@ -279,8 +289,8 @@ void loop() {
         }
     }
 
-    int finalTurnWeight = turnWeight;
-    float controlTurnWeight = static_cast<float>(turnWeight);
+    int finalTurnWeight = static_cast<int>(lroundf(turnWeight));
+    float controlTurnWeight = turnWeight;
     float grayDCorrection = 0.0f;
 
     if (realLost) {
@@ -304,13 +314,23 @@ void loop() {
 
     } else {
         // 普通循迹：直接使用灰度传感器算出来的转向权重
-        finalTurnWeight = turnWeight;
-        controlTurnWeight = static_cast<float>(finalTurnWeight);
+        finalTurnWeight = static_cast<int>(lroundf(turnWeight));
+        controlTurnWeight = turnWeight;
 
-        if (ENABLE_GRAY_D_CORRECTION && lineSeen) {
+        bool centerLocked = ENABLE_STRAIGHT_CENTER_LOCK && straightLockCount >= STRAIGHT_LOCK_CONFIRM_COUNT;
+        if (centerLocked) {
+            controlTurnWeight = 0.0f;
+            lastGrayDWeight = turnWeight;
+            hasGrayDWeight = true;
+
+        } else if (straightCandidate) {
+            lastGrayDWeight = turnWeight;
+            hasGrayDWeight = true;
+
+        } else if (ENABLE_GRAY_D_CORRECTION && lineSeen) {
             if (hasGrayDWeight) {
-                int deltaWeight = turnWeight - lastGrayDWeight;
-                grayDCorrection = GRAY_D_GAIN * static_cast<float>(deltaWeight);
+                float deltaWeight = turnWeight - lastGrayDWeight;
+                grayDCorrection = GRAY_D_GAIN * deltaWeight;
                 grayDCorrection = constrain(
                     grayDCorrection,
                     -GRAY_D_CORRECTION_CLAMP,
@@ -354,7 +374,7 @@ void loop() {
     if (now - lastPrintMs >= PRINT_INTERVAL_MS) {
         lastPrintMs = now;
         Serial.printf(
-            "t=%lu gray=%d line=%d hardL=%d hardR=%d lost=%d base=%d grayD=%.2f turn=%d ctrl=%.2f L=%d R=%d\r\n",
+            "t=%lu gray=%.2f line=%d hardL=%d hardR=%d lost=%d base=%d grayD=%.2f turn=%d ctrl=%.2f L=%d R=%d\r\n",
             static_cast<unsigned long>(now),
             turnWeight,
             lineSeen ? 1 : 0,
