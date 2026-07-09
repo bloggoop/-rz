@@ -13,19 +13,18 @@ constexpr int PWM_MAX = 1023;
 
 // 左电机整体补偿。
 // 左轮偏快就填负数，左轮偏慢就填正数。
-constexpr int LEFT_SPEED_TRIM = -3;
+constexpr int LEFT_SPEED_TRIM = -5;
 
 // 基础前进速度。
 // 太容易冲出去就调小，跑得太慢就调大。
-constexpr int BASE_SPEED = 50;
+constexpr int BASE_SPEED = 55;
 
 // 最大速度限制，防止输出过大。
-constexpr int MAX_SPEED = 90;
+constexpr int MAX_SPEED = 400;
 
 // 普通循迹转向力度。
 // 这里相当于差速转向的 P：弯转不过就加大，左右抖就减小。
-constexpr int TURN_SPEED_STEP = 30;
-
+constexpr int TURN_SPEED_STEP = 25;
 
 // 是否启用 V1 本地灰度 PD 的 D 项。
 // 默认关闭，保持当前稳定巡线行为；要抑制小幅摆头时再打开。
@@ -33,14 +32,14 @@ constexpr bool ENABLE_GRAY_D_CORRECTION = true;
 
 // 灰度误差变化量对转向的阻尼强度。
 // 太抖就加大一点；入弯变钝或转不过就减小。
-constexpr float GRAY_D_GAIN = 10.0f;
+constexpr float GRAY_D_GAIN = 45.0f;
 
 // 灰度 D 单次最大修正，防止权重跳变时一把修过头。
-constexpr float GRAY_D_CORRECTION_CLAMP =40.0f;
+constexpr float GRAY_D_CORRECTION_CLAMP = 50.0f;
 
 // 直角弯时使用的强制转向权重。
 // 转出去或甩头就降低；直角转不过再升。
-constexpr int HARD_TURN_WEIGHT = 100;
+constexpr int HARD_TURN_WEIGHT = 400;
 
 // 丢线找线时使用的转向权重。
 // 丢线后找不回来就升到 5；乱甩就降到 3
@@ -52,11 +51,11 @@ constexpr int HARD_CONFIRM_COUNT = 2;
 
 // 连续丢线几次，才进入丢线找线
 // 误触发 LOST 就升到 4；丢线救不回来就降到 2
-constexpr int LOST_CONFIRM_COUNT = 4;
+constexpr int LOST_CONFIRM_COUNT = 5;
 
 // 主循环延时
 // 3ms 反应更快；太抖再加到 5ms。
-constexpr int LOOP_DELAY_MS = 3;
+constexpr int LOOP_DELAY_MS = 1;
 
 // 详细日志的打印间隔。
 constexpr uint32_t SERIAL_TRACE_INTERVAL_MS = 100;
@@ -74,7 +73,7 @@ constexpr int GRAY_THRESHOLD = 4000;
 // 五个灰度传感器对应的转向权重：
 // 左外、左内、中、右内、右外。
 // 比 {-10,-5,0,5,10} 温和，但比 {-4,-2,0,2,4} 更早点给出弯道偏差。
-constexpr int GRAY_SENSOR_WEIGHTS[5] = {-8, -3, 0, 3, 8};
+constexpr int GRAY_SENSOR_WEIGHTS[5] = {-9, -3, 0, 3, 9};
 
 // 指示灯 PWM 参数
 constexpr int LED_PIN = 22;

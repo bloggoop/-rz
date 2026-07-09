@@ -550,6 +550,18 @@ void loop() {
     int leftSpeed = BASE_SPEED - speedDelta;
     int rightSpeed = BASE_SPEED + speedDelta;
 
+    if (hardRight)
+    {
+        leftSpeed = -100;
+        rightSpeed = 100;
+    }
+
+    if (hardLeft)
+    {
+        leftSpeed = 100;
+        rightSpeed = -100;       
+    }
+
     // 左电机通常会比右电机略快一点，这里做整体补偿
     leftSpeed += LEFT_SPEED_TRIM;
 
